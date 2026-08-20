@@ -62,7 +62,7 @@ def fetch_zone_climate(zone_id, zone):
         "timezone": "Asia/Omsk",
     }
 
-    data = fetch_with_retry(ARCHIVE_URL, params)
+    data = fetch_with_retry(ARCHIVE_URL, params, timeout=90)
     daily = data["daily"]
     times = daily["time"]
     temps = daily["temperature_2m_mean"]
