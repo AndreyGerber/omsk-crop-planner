@@ -171,7 +171,17 @@ def render_zone_map(selected_zone_id):
         location=[55.5, 73.5],
         zoom_start=6,
         tiles="CartoDB positron",
+        attributionControl=False,  # Standard-Attribution (inkl. Leaflet-Praefix) deaktivieren
     )
+    # Eigene, schlichte Attribution ohne Leaflet-Branding ergaenzen -- die
+    # Namensnennung fuer OpenStreetMap/CARTO bleibt Pflicht, nur der
+    # Leaflet-eigene Zusatz (inkl. Ukraine-Flagge) wird weggelassen.
+    attribution_js = (
+        f"L.control.attribution({{prefix: false, position: 'bottomright'}})"
+        f".addTo({m.get_name()})"
+        f".addAttribution('\u00a9 OpenStreetMap contributors \u00a9 CARTO');"
+    )
+    m.get_root().script.add_child(folium.Element(attribution_js))
 
     for zone_id, info in ZONE_MAP_INFO.items():
         is_selected = zone_id == selected_zone_id
