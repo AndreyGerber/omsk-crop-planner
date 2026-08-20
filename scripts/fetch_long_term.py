@@ -27,6 +27,7 @@ verfügbar über ERA5-Reanalyse).
 
 import os
 import csv
+import time
 from datetime import date, timedelta
 from collections import defaultdict
 
@@ -145,24 +146,21 @@ def _aggregate_window(per_year_metrics, years_wanted):
     }
 
 
-def fetch_zone_climate(zone_id, zone):
-    end_year = date.today().year - 1  # letztes abgeschlossenes Jahr
-    start_year_long = end_year - YEARS_LONG + 1
-    start_year_short = end_year - YEARS_SHORT + 1
+CHUNK_SIZE_YEARS = 10  # Größe der einzelnen API-Anfragen, statt 30 Jahre am Stück
 
+
+def _fetch_chunk(zone, chunk_start_year, chunk_end_year):
     params = {
         "latitude": zone["lat"],
         "longitude": zone["lon"],
-        "start_date": f"{start_year_long}-{FETCH_START_MD}",
-        "end_date": f"{end_year}-{FETCH_END_MD}",
+        "start_date": f"{chunk_start_year}-{FETCH_START_MD}",
+        "end_date": f"{chunk_end_year}-{FETCH_END_MD}",
         "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,sunshine_duration",
         "timezone": "Asia/Omsk",
     }
-
-    data = fetch_with_retry(ARCHIVE_URL, params, timeout=90)
+    data = fetch_with_retry(ARCHIVE_URL, params, timeout=60, request_gap_seconds=3.0)
     daily = data["daily"]
-
-    records = [
+    return [
         {
             "date": date.fromisoformat(daily["time"][i]),
             "mean": daily["temperature_2m_mean"][i],
@@ -173,6 +171,22 @@ def fetch_zone_climate(zone_id, zone):
         }
         for i in range(len(daily["time"]))
     ]
+
+
+def fetch_zone_climate(zone_id, zone):
+    end_year = date.today().year - 1  # letztes abgeschlossenes Jahr
+    start_year_long = end_year - YEARS_LONG + 1
+    start_year_short = end_year - YEARS_SHORT + 1
+
+    # Abfrage in ~10-Jahres-Häppchen statt einer großen 30-Jahres-Anfrage,
+    # um Timeouts und Rate-Limits bei der API zu vermeiden.
+    records = []
+    chunk_start = start_year_long
+    while chunk_start <= end_year:
+        chunk_end = min(chunk_start + CHUNK_SIZE_YEARS - 1, end_year)
+        print(f"  Chunk {chunk_start}-{chunk_end} für Zone {zone_id}")
+        records.extend(_fetch_chunk(zone, chunk_start, chunk_end))
+        chunk_start = chunk_end + 1
 
     by_year = defaultdict(list)
     for r in records:
@@ -207,9 +221,11 @@ def main():
     file_exists = os.path.isfile(out_file)
 
     rows = []
-    for zone_id, zone in ZONES.items():
+    for i, (zone_id, zone) in enumerate(ZONES.items()):
         print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (April-Oktober, daraus alle Kennzahlen berechnet)")
         rows.append(fetch_zone_climate(zone_id, zone))
+        if i < len(ZONES) - 1:
+            time.sleep(5)  # kurze Pause zwischen Zonen, zusätzlich zur Pause zwischen Chunks
 
     with open(out_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
