@@ -1,14 +1,25 @@
 """
-Jährliche Abfrage langfristiger Wetterdaten je Zone.
+Jährliche Abfrage agronomischer Klimakennzahlen je Zone.
 Wird per GitHub Actions Cron einmal pro Jahr (1. Januar) ausgeführt (siehe
 .github/workflows/yearly_weather.yml).
 
-Berechnet ZWEI Zeitfenster parallel aus EINEM API-Call pro Zone:
-- 10 Jahre: reagiert schneller auf aktuelle Verschiebungen (kurzfristigerer Trend)
-- 30 Jahre: WMO-Standard für Klimanormalperioden, robuster gegen Einzeljahr-Ausreißer
+WARUM KEINE EINFACHEN SAISONMITTELWERTE:
+Ein reiner Mai-September-Durchschnitt verschluckt genau die Informationen,
+die für die Anbauplanung zählen: Timing von Frost/Trockenheit, Extremereignisse,
+Streuung zwischen Jahren. Stattdessen werden hier pro Jahr agronomisch
+relevante Kennzahlen berechnet und erst danach über 10/30 Jahre gemittelt:
 
-Beide Fenster werden aus derselben 30-Jahres-Rohdatenabfrage berechnet, statt
-zwei getrennte Requests zu senden (weniger Last auf der API, ein Call reicht).
+- Wärmesumme (Growing Degree Days, Basis 5°C) — bestimmt Reifegeschwindigkeit
+- Letzter Frühjahrsfrost / erster Herbstfrost — bestimmt nutzbare Vegetationszeit
+- Längste zusammenhängende Trockenperiode — oft ertragsentscheidender als
+  die Niederschlagssumme
+- Anzahl Hitzetage (>30°C) — Stressindikator, geht in einem Mittelwert unter
+
+Ein einzelner API-Call pro Zone holt Rohdaten von April bis Oktober über den
+vollen 30-Jahres-Zeitraum (breiter als die eigentliche Mai-September-Kernsaison,
+damit auch Frühjahrs-/Herbstfrost außerhalb der Kernsaison erfasst wird).
+Daraus werden alle Kennzahlen pro Jahr berechnet, dann für 10j- und
+30j-Fenster aggregiert.
 
 Quelle: Open-Meteo Archive API (kostenlos, kein API-Key nötig, Daten ab 1940
 verfügbar über ERA5-Reanalyse).
@@ -16,7 +27,8 @@ verfügbar über ERA5-Reanalyse).
 
 import os
 import csv
-from datetime import date
+from datetime import date, timedelta
+from collections import defaultdict
 
 from zones import ZONES
 from fetch_utils import fetch_with_retry
@@ -27,24 +39,109 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "long_term")
 YEARS_LONG = 30  # WMO-Standard-Klimanormalperiode
 YEARS_SHORT = 10  # kurzfristigerer Trend innerhalb desselben Datensatzes
 
-# Vegetationsperiode grob Mai-September - kann später pro Zone verfeinert werden
-SEASON_START_MD = "05-01"
-SEASON_END_MD = "09-30"
+# Rohdaten-Abfragefenster: breiter als die Kernsaison, damit Frost VOR/NACH
+# der eigentlichen Mai-September-Periode erfasst wird.
+FETCH_START_MD = "04-01"
+FETCH_END_MD = "10-31"
+
+# Agronomische Kernsaison für GDD/Niederschlag/Hitzetage/Trockenperiode
+CORE_SEASON_MONTHS = (5, 9)
+# Suchfenster für Frost-Ereignisse
+SPRING_FROST_MONTHS = (4, 5)
+FALL_FROST_MONTHS = (9, 10)
+
+BASE_TEMP_GDD = 5.0       # Basistemperatur für Wärmesumme (Getreide-Standard)
+HEAT_THRESHOLD_C = 30.0   # ab dieser Max-Temperatur zählt ein Tag als Hitzetag
+DRY_DAY_THRESHOLD_MM = 1.0  # unter diesem Niederschlag zählt ein Tag als "trocken"
+
+REFERENCE_YEAR_FOR_DOY = 2001  # Nicht-Schaltjahr, nur zur Umrechnung Tag-des-Jahres -> Datum
 
 
-def _aggregate(times, temps, precip, sunshine, from_year, end_year):
-    """Aggregiert die Tagesdaten für ein bestimmtes Jahresfenster [from_year, end_year]."""
-    idx = [i for i, t in enumerate(times) if from_year <= int(t[:4]) <= end_year]
-    n_seasons = end_year - from_year + 1
+def _longest_dry_spell(records):
+    """Längste Folge aufeinanderfolgender Tage mit Niederschlag unter der Trockenschwelle."""
+    longest = current = 0
+    for r in records:
+        if r["precip"] < DRY_DAY_THRESHOLD_MM:
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    return longest
 
-    avg_temp = sum(temps[i] for i in idx) / len(idx)
-    avg_precip_per_season = sum(precip[i] for i in idx) / n_seasons
-    avg_sunshine_h_per_season = (sum(sunshine[i] for i in idx) / 3600) / n_seasons
+
+def _compute_year_metrics(year_records):
+    """Berechnet alle Kennzahlen für EIN Kalenderjahr aus dessen Tagesdaten."""
+    year_records = sorted(year_records, key=lambda r: r["date"])
+    core = [r for r in year_records if CORE_SEASON_MONTHS[0] <= r["date"].month <= CORE_SEASON_MONTHS[1]]
+    spring = [r for r in year_records if SPRING_FROST_MONTHS[0] <= r["date"].month <= SPRING_FROST_MONTHS[1]]
+    fall = [r for r in year_records if FALL_FROST_MONTHS[0] <= r["date"].month <= FALL_FROST_MONTHS[1]]
+
+    if not core:
+        return None
+
+    gdd = sum(max(0.0, r["mean"] - BASE_TEMP_GDD) for r in core)
+    precip_sum = sum(r["precip"] for r in core)
+    sun_sum_h = sum(r["sun"] for r in core) / 3600
+    heat_days = sum(1 for r in core if r["max"] > HEAT_THRESHOLD_C)
+    dry_spell = _longest_dry_spell(core)
+    temp_mean = sum(r["mean"] for r in core) / len(core)
+
+    last_spring_frost = None
+    for r in spring:
+        if r["min"] <= 0:
+            last_spring_frost = r["date"]  # letztes Vorkommen im Fenster behalten
+
+    first_fall_frost = None
+    for r in fall:
+        if r["min"] <= 0:
+            first_fall_frost = r["date"]
+            break
 
     return {
-        "temperatur_mittel_c": round(avg_temp, 1),
-        "niederschlag_mittel_pro_saison_mm": round(avg_precip_per_season, 1),
-        "sonnenstunden_mittel_pro_saison": round(avg_sunshine_h_per_season, 1),
+        "gdd": gdd,
+        "precip_mm": precip_sum,
+        "sun_h": sun_sum_h,
+        "heat_days": heat_days,
+        "dry_spell_days": dry_spell,
+        "temp_mean_c": temp_mean,
+        "last_spring_frost_doy": last_spring_frost.timetuple().tm_yday if last_spring_frost else None,
+        "first_fall_frost_doy": first_fall_frost.timetuple().tm_yday if first_fall_frost else None,
+    }
+
+
+def _doy_to_md_string(mean_doy):
+    """Rechnet einen (gemittelten) Tag-des-Jahres zurück in ein lesbares MM-DD-Datum."""
+    if mean_doy is None:
+        return None
+    ref_date = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=round(mean_doy) - 1)
+    return ref_date.strftime("%m-%d")
+
+
+def _aggregate_window(per_year_metrics, years_wanted):
+    """Mittelt die pro-Jahr-Kennzahlen über ein gewünschtes Jahresfenster."""
+    subset = [per_year_metrics[y] for y in years_wanted if y in per_year_metrics and per_year_metrics[y]]
+    n = len(subset)
+
+    def avg(key):
+        vals = [s[key] for s in subset if s[key] is not None]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    spring_frost_vals = [s["last_spring_frost_doy"] for s in subset if s["last_spring_frost_doy"] is not None]
+    fall_frost_vals = [s["first_fall_frost_doy"] for s in subset if s["first_fall_frost_doy"] is not None]
+    mean_spring_doy = sum(spring_frost_vals) / len(spring_frost_vals) if spring_frost_vals else None
+    mean_fall_doy = sum(fall_frost_vals) / len(fall_frost_vals) if fall_frost_vals else None
+
+    return {
+        "temperatur_mittel_c": avg("temp_mean_c"),
+        "niederschlag_mittel_pro_saison_mm": avg("precip_mm"),
+        "sonnenstunden_mittel_pro_saison": avg("sun_h"),
+        "waermesumme_gdd_mittel": avg("gdd"),
+        "hitzetage_ueber_30c_mittel": avg("heat_days"),
+        "laengste_trockenperiode_tage_mittel": avg("dry_spell_days"),
+        "letzter_fruehjahrsfrost_datum_approx": _doy_to_md_string(mean_spring_doy),
+        "erster_herbstfrost_datum_approx": _doy_to_md_string(mean_fall_doy),
+        "jahre_ohne_erkannten_fruehjahrsfrost": n - len(spring_frost_vals),
+        "anzahl_jahre_in_auswertung": n,
     }
 
 
@@ -56,37 +153,52 @@ def fetch_zone_climate(zone_id, zone):
     params = {
         "latitude": zone["lat"],
         "longitude": zone["lon"],
-        "start_date": f"{start_year_long}-{SEASON_START_MD}",
-        "end_date": f"{end_year}-{SEASON_END_MD}",
-        "daily": "temperature_2m_mean,precipitation_sum,sunshine_duration",
+        "start_date": f"{start_year_long}-{FETCH_START_MD}",
+        "end_date": f"{end_year}-{FETCH_END_MD}",
+        "daily": "temperature_2m_mean,temperature_2m_max,temperature_2m_min,precipitation_sum,sunshine_duration",
         "timezone": "Asia/Omsk",
     }
 
     data = fetch_with_retry(ARCHIVE_URL, params, timeout=90)
     daily = data["daily"]
-    times = daily["time"]
-    temps = daily["temperature_2m_mean"]
-    precip = daily["precipitation_sum"]
-    sunshine = daily["sunshine_duration"]
 
-    stats_10y = _aggregate(times, temps, precip, sunshine, start_year_short, end_year)
-    stats_30y = _aggregate(times, temps, precip, sunshine, start_year_long, end_year)
+    records = [
+        {
+            "date": date.fromisoformat(daily["time"][i]),
+            "mean": daily["temperature_2m_mean"][i],
+            "max": daily["temperature_2m_max"][i],
+            "min": daily["temperature_2m_min"][i],
+            "precip": daily["precipitation_sum"][i],
+            "sun": daily["sunshine_duration"][i],
+        }
+        for i in range(len(daily["time"]))
+    ]
 
-    return {
+    by_year = defaultdict(list)
+    for r in records:
+        by_year[r["date"].year].append(r)
+
+    per_year_metrics = {year: _compute_year_metrics(recs) for year, recs in by_year.items()}
+
+    years_10 = range(start_year_short, end_year + 1)
+    years_30 = range(start_year_long, end_year + 1)
+
+    stats_10y = _aggregate_window(per_year_metrics, years_10)
+    stats_30y = _aggregate_window(per_year_metrics, years_30)
+
+    row = {
         "abfrage_datum": date.today().isoformat(),
         "zone_id": zone_id,
         "zone_name": zone["name_ru"],
         "zeitraum_10j_von": start_year_short,
         "zeitraum_10j_bis": end_year,
-        "temperatur_mittel_c_10j": stats_10y["temperatur_mittel_c"],
-        "niederschlag_mittel_pro_saison_mm_10j": stats_10y["niederschlag_mittel_pro_saison_mm"],
-        "sonnenstunden_mittel_pro_saison_10j": stats_10y["sonnenstunden_mittel_pro_saison"],
-        "zeitraum_30j_von": start_year_long,
-        "zeitraum_30j_bis": end_year,
-        "temperatur_mittel_c_30j": stats_30y["temperatur_mittel_c"],
-        "niederschlag_mittel_pro_saison_mm_30j": stats_30y["niederschlag_mittel_pro_saison_mm"],
-        "sonnenstunden_mittel_pro_saison_30j": stats_30y["sonnenstunden_mittel_pro_saison"],
     }
+    row.update({f"{k}_10j": v for k, v in stats_10y.items()})
+    row["zeitraum_30j_von"] = start_year_long
+    row["zeitraum_30j_bis"] = end_year
+    row.update({f"{k}_30j": v for k, v in stats_30y.items()})
+
+    return row
 
 
 def main():
@@ -96,7 +208,7 @@ def main():
 
     rows = []
     for zone_id, zone in ZONES.items():
-        print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (daraus {YEARS_SHORT}j + {YEARS_LONG}j berechnet)")
+        print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (April-Oktober, daraus alle Kennzahlen berechnet)")
         rows.append(fetch_zone_climate(zone_id, zone))
 
     with open(out_file, "a", newline="", encoding="utf-8") as f:
