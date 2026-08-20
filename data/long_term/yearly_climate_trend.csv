@@ -1,0 +1,5 @@
+abfrage_datum,zeitraum_von_jahr,zeitraum_bis_jahr,zone_id,zone_name,temperatur_mittel_c,niederschlag_mittel_pro_saison_mm,sonnenstunden_mittel_pro_saison
+2026-08-20,2016,2025,north_taiga,Север (тайга),2.4,564.4,2552.1
+2026-08-20,2016,2025,north_foreststeppe,Северная лесостепь,3.0,477.4,2705.7
+2026-08-20,2016,2025,south_foreststeppe,Южная лесостепь,3.6,432.6,2776.1
+2026-08-20,2016,2025,steppe,Степь,4.7,374.2,2889.4
