@@ -1,0 +1,5 @@
+abfrage_datum,zeitraum_von,zeitraum_bis,zone_id,zone_name,temperatur_mittel_c,niederschlag_summe_mm,sonnenstunden_summe
+2026-08-20,2026-08-13,2026-08-19,north_taiga,Север (тайга),16.6,10.4,76.3
+2026-08-20,2026-08-13,2026-08-19,north_foreststeppe,Северная лесостепь,17.5,9.1,86.4
+2026-08-20,2026-08-13,2026-08-19,south_foreststeppe,Южная лесостепь,18.6,15.5,88.5
+2026-08-20,2026-08-13,2026-08-19,steppe,Степь,20.2,10.5,88.7
