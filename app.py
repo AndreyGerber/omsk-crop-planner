@@ -242,7 +242,40 @@ CROPS = {
     },
 }
 
-SOIL_TYPES = ["Чернозём южный", "Чернозём обыкновенный", "Чернозём выщелоченный", "Серая лесная", "Подзолистая"]
+SOIL_TYPES_INFO = {
+    "Чернозём южный": {
+        "гумус": "4–6%",
+        "типичная_зона": "Степь",
+        "описание": "Самый южный и наименее плодородный из чернозёмов. Формируется в засушливых "
+                     "степных условиях, тоньше гумусовый слой, но структура хорошая — неплохо "
+                     "удерживает влагу. Подходит для засухоустойчивых культур.",
+    },
+    "Чернозём обыкновенный": {
+        "гумус": "6–8%",
+        "типичная_зона": "Южная лесостепь",
+        "описание": "Промежуточный тип по плодородию — больше гумуса и влаги, чем у южного "
+                     "чернозёма, но суше и беднее, чем выщелоченный.",
+    },
+    "Чернозём выщелоченный": {
+        "гумус": "8–10%",
+        "типичная_зона": "Северная лесостепь",
+        "описание": "Один из самых плодородных типов почв в регионе — толстый гумусовый "
+                     "горизонт, хорошо удерживает влагу и питательные вещества.",
+    },
+    "Серая лесная": {
+        "гумус": "2–4%",
+        "типичная_зона": "Переходная зона к лесу",
+        "описание": "Переходный тип между чернозёмом и подзолистыми почвами. Менее плодородна, "
+                     "чем чернозёмы, но лучше подзолистых почв севера.",
+    },
+    "Подзолистая": {
+        "гумус": "<2%",
+        "типичная_зона": "Север / тайга",
+        "описание": "Самая бедная почва в регионе — низкое содержание гумуса, кислая реакция. "
+                     "Требует более неприхотливых культур с низкими требованиями к плодородию.",
+    },
+}
+SOIL_TYPES = list(SOIL_TYPES_INFO.keys())
 
 # Пороговые значения "комфортных" хитдней по уровню жаростойкости —
 # используются для расчёта штрафа за жару.
@@ -404,6 +437,18 @@ with col2:
     humus = st.number_input("Содержание гумуса (%)", min_value=0.0, max_value=15.0, value=5.0, step=0.1)
     drainage = st.selectbox("Дренаж", ["Хороший дренаж", "Средний дренаж", "Застойное (сырое)"])
 
+selected_soil_info = SOIL_TYPES_INFO[soil_type]
+st.caption(
+    f"**{soil_type}** — гумус обычно {selected_soil_info['гумус']}, типичная зона: "
+    f"{selected_soil_info['типичная_зона']}. {selected_soil_info['описание']}"
+)
+with st.expander("Сравнение всех типов почв"):
+    soil_table = pd.DataFrame([
+        {"Тип почвы": name, "Гумус": info["гумус"], "Типичная зона": info["типичная_зона"]}
+        for name, info in SOIL_TYPES_INFO.items()
+    ])
+    st.dataframe(soil_table, use_container_width=True, hide_index=True)
+
 st.header("2. Зона расположения поля")
 zone_id = st.selectbox(
     "Агроклиматическая зона (полоса ~100 км)",
@@ -451,26 +496,49 @@ for i, offset in enumerate([4, 3, 2, 1]):
 st.header("4. Приоритеты при выборе культуры")
 st.caption(
     "Настройте, насколько важен каждый параметр при расчёте балла пригодности. "
-    "Абсолютные значения не важны — важно соотношение между ползунками."
+    "Сумма всех ползунков должна быть ровно 100%."
 )
+
+WEIGHT_KEYS = {
+    "почва": "w_soil", "ph": "w_ph", "окно": "w_window", "gdd": "w_gdd",
+    "вода": "w_water", "жара": "w_heat", "урожайность": "w_yield",
+}
+
+
+def _normalize_weights_to_100(weights):
+    """Skaliert Gewichte proportional so, dass sie exakt 100 ergeben (Largest-Remainder-Methode)."""
+    total = sum(weights.values())
+    keys = list(weights.keys())
+    if total == 0:
+        base, rest = divmod(100, len(keys))
+        return {k: base + (1 if i < rest else 0) for i, k in enumerate(keys)}
+    raw = {k: v / total * 100 for k, v in weights.items()}
+    floored = {k: int(raw[k]) for k in keys}
+    remainder = 100 - sum(floored.values())
+    order = sorted(keys, key=lambda k: raw[k] - floored[k], reverse=True)
+    result = dict(floored)
+    for k in order[:remainder]:
+        result[k] += 1
+    return result
+
 
 weight_row1 = st.columns(4)
 with weight_row1[0]:
-    w_soil = st.slider("Тип почвы", 0, 100, DEFAULT_WEIGHTS["почва"], help="Насколько важно точное совпадение почвы")
+    w_soil = st.slider("Тип почвы", 0, 100, DEFAULT_WEIGHTS["почва"], key="w_soil", help="Насколько важно точное совпадение почвы")
 with weight_row1[1]:
-    w_ph = st.slider("pH почвы", 0, 100, DEFAULT_WEIGHTS["ph"], help="Насколько важен диапазон pH культуры")
+    w_ph = st.slider("pH почвы", 0, 100, DEFAULT_WEIGHTS["ph"], key="w_ph", help="Насколько важен диапазон pH культуры")
 with weight_row1[2]:
-    w_window = st.slider("Вегетационное окно", 0, 100, DEFAULT_WEIGHTS["окно"], help="Насколько важен запас дней между заморозками")
+    w_window = st.slider("Вегетационное окно", 0, 100, DEFAULT_WEIGHTS["окно"], key="w_window", help="Насколько важен запас дней между заморозками")
 with weight_row1[3]:
-    w_gdd = st.slider("Тепловая сумма (GDD)", 0, 100, DEFAULT_WEIGHTS["gdd"], help="Насколько важно, чтобы зоне хватало тепла для вызревания")
+    w_gdd = st.slider("Тепловая сумма (GDD)", 0, 100, DEFAULT_WEIGHTS["gdd"], key="w_gdd", help="Насколько важно, чтобы зоне хватало тепла для вызревания")
 
 weight_row2 = st.columns(3)
 with weight_row2[0]:
-    w_water = st.slider("Влагообеспеченность", 0, 100, DEFAULT_WEIGHTS["вода"], help="Осадки + риск длинной засухи")
+    w_water = st.slider("Влагообеспеченность", 0, 100, DEFAULT_WEIGHTS["вода"], key="w_water", help="Осадки + риск длинной засухи")
 with weight_row2[1]:
-    w_heat = st.slider("Жаростойкость", 0, 100, DEFAULT_WEIGHTS["жара"], help="Насколько важна устойчивость к жарким дням")
+    w_heat = st.slider("Жаростойкость", 0, 100, DEFAULT_WEIGHTS["жара"], key="w_heat", help="Насколько важна устойчивость к жарким дням")
 with weight_row2[2]:
-    w_yield = st.slider("Урожайность", 0, 100, DEFAULT_WEIGHTS["урожайность"], help="Насколько важен потенциальный урожай (ц/га)")
+    w_yield = st.slider("Урожайность", 0, 100, DEFAULT_WEIGHTS["урожайность"], key="w_yield", help="Насколько важен потенциальный урожай (ц/га)")
 
 user_weights = {
     "почва": w_soil,
@@ -483,17 +551,24 @@ user_weights = {
 }
 
 total_w = sum(user_weights.values())
-if total_w == 0:
-    st.warning("Все ползунки на нуле — установите хотя бы один приоритет выше 0, чтобы модель могла считать.")
-else:
-    st.caption(
-        "Текущее соотношение: "
-        + " · ".join(f"{k}: {round(v / total_w * 100)}%" for k, v in user_weights.items())
+weights_valid = (total_w == 100)
+
+if weights_valid:
+    st.success(
+        "Сумма приоритетов: 100% ✅ — "
+        + " · ".join(f"{k}: {v}%" for k, v in user_weights.items())
     )
+else:
+    st.error(f"Сумма приоритетов должна быть ровно 100%. Сейчас: {total_w}%.")
+    if st.button("⚖️ Нормализовать до 100%"):
+        normalized = _normalize_weights_to_100(user_weights)
+        for weight_key, session_key in WEIGHT_KEYS.items():
+            st.session_state[session_key] = normalized[weight_key]
+        st.rerun()
 
 st.divider()
 
-if st.button("🚀 Начать моделирование", type="primary", disabled=(total_w == 0)):
+if st.button("🚀 Начать моделирование", type="primary", disabled=(not weights_valid)):
     results = []
     for crop_name, crop in CROPS.items():
         s = score_crop(crop_name, crop, zone, soil_type, ph, drainage, user_weights)
