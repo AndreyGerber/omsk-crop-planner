@@ -12,36 +12,97 @@ st.set_page_config(page_title="Оптимизация посева — Омск�
 # СПРАВОЧНЫЕ ДАННЫЕ (заглушки — в реальной версии заменяются на API/базу данных)
 # ---------------------------------------------------------------------------
 
-ZONES = {
-    "Север (тайга)": {
+import os
+
+# Statische Zonen-Metadaten (Bodenprofile, Frosttage) — ändern sich kaum,
+# bleiben daher als Referenztabelle im Code. zone_id entspricht 1:1 den IDs
+# in scripts/zones.py, damit beide Teile des Projekts zusammenpassen.
+ZONE_STATIC = {
+    "north_taiga": {
+        "name_ru": "Север (тайга)",
         "безморозные_дни": 95,
         "вегетационный_период_дни": 105,
-        "осадки_мм": 320,
-        "температура_ср": 15.5,
         "почвы_типичные": ["Подзолистая", "Серая лесная"],
     },
-    "Северная лесостепь": {
+    "north_foreststeppe": {
+        "name_ru": "Северная лесостепь",
         "безморозные_дни": 110,
         "вегетационный_период_дни": 120,
-        "осадки_мм": 300,
-        "температура_ср": 17.0,
         "почвы_типичные": ["Серая лесная", "Чернозём выщелоченный"],
     },
-    "Южная лесостепь": {
+    "south_foreststeppe": {
+        "name_ru": "Южная лесостепь",
         "безморозные_дни": 120,
         "вегетационный_период_дни": 130,
-        "осадки_мм": 280,
-        "температура_ср": 18.5,
         "почвы_типичные": ["Чернозём выщелоченный", "Чернозём обыкновенный"],
     },
-    "Степь": {
+    "steppe": {
+        "name_ru": "Степь",
         "безморозные_дни": 130,
         "вегетационный_период_дни": 140,
-        "осадки_мм": 250,
-        "температура_ср": 19.5,
         "почвы_типичные": ["Чернозём обыкновенный", "Чернозём южный"],
     },
 }
+
+# Fallback-Klimawerte, falls noch keine CSV-Daten vorliegen (z.B. vor dem
+# allerersten Workflow-Lauf) — damit die App nie abstürzt, nur mit alten
+# Platzhaltern weiterläuft.
+CLIMATE_FALLBACK = {
+    "north_taiga": {"осадки_мм": 320, "температура_ср": 15.5},
+    "north_foreststeppe": {"осадки_мм": 300, "температура_ср": 17.0},
+    "south_foreststeppe": {"осадки_мм": 280, "температура_ср": 18.5},
+    "steppe": {"осадки_мм": 250, "температура_ср": 19.5},
+}
+
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+SHORT_TERM_CSV = os.path.join(REPO_ROOT, "data", "short_term", "weekly_weather.csv")
+LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_trend.csv")
+
+
+@st.cache_data(ttl=3600)
+def load_latest_by_zone(csv_path, date_col="abfrage_datum"):
+    """Lädt eine CSV und gibt pro zone_id nur die neueste Zeile zurück (als dict)."""
+    if not os.path.isfile(csv_path):
+        return {}
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return {}
+    df[date_col] = pd.to_datetime(df[date_col])
+    latest = df.sort_values(date_col).groupby("zone_id").tail(1)
+    return latest.set_index("zone_id").to_dict("index")
+
+
+def build_zones():
+    """Kombiniert statische Metadaten mit den neuesten CSV-Klimadaten (30j-Basis)."""
+    long_term = load_latest_by_zone(LONG_TERM_CSV)
+    short_term = load_latest_by_zone(SHORT_TERM_CSV)
+
+    zones = {}
+    for zone_id, meta in ZONE_STATIC.items():
+        zone = dict(meta)
+        lt = long_term.get(zone_id)
+        if lt is not None:
+            zone["осадки_мм"] = lt["niederschlag_mittel_pro_saison_mm_30j"]
+            zone["температура_ср"] = lt["temperatur_mittel_c_30j"]
+            zone["_осадки_10j"] = lt["niederschlag_mittel_pro_saison_mm_10j"]
+            zone["_температура_10j"] = lt["temperatur_mittel_c_10j"]
+            zone["_datenquelle"] = f"CSV (30J: {lt['zeitraum_30j_von']}–{lt['zeitraum_30j_bis']})"
+        else:
+            zone["осадки_мм"] = CLIMATE_FALLBACK[zone_id]["осадки_мм"]
+            zone["температура_ср"] = CLIMATE_FALLBACK[zone_id]["температура_ср"]
+            zone["_datenquelle"] = "Platzhalter (noch keine CSV-Daten gefunden)"
+
+        st_data = short_term.get(zone_id)
+        if st_data is not None:
+            zone["_kurzfristig_temperatur"] = st_data["temperatur_mittel_c"]
+            zone["_kurzfristig_niederschlag"] = st_data["niederschlag_summe_mm"]
+            zone["_kurzfristig_zeitraum"] = f"{st_data['zeitraum_von']} – {st_data['zeitraum_bis']}"
+
+        zones[zone_id] = zone
+    return zones
+
+
+ZONES = build_zones()
 
 CROPS = {
     "Яровая пшеница": {
@@ -254,6 +315,13 @@ def apply_rotation_filter(ranked_df, history):
 st.title("🌾 Модель оптимального выбора культур — Омская область")
 st.caption("Прототип: подбор 8–10 лучших культур для конкретного поля с учётом почвы, климата зоны и истории севооборота")
 
+if not os.path.isfile(LONG_TERM_CSV) and not os.path.isfile(SHORT_TERM_CSV):
+    st.info(
+        "ℹ️ Пока не найдено ни одного файла с данными в `data/`. Используются "
+        "заглушки. Запустите workflow'ы в GitHub Actions и сделайте `git pull`, "
+        "чтобы подтянуть реальные климатические данные."
+    )
+
 st.header("1. Параметры почвы поля")
 col1, col2 = st.columns(2)
 with col1:
@@ -264,13 +332,29 @@ with col2:
     drainage = st.selectbox("Дренаж", ["Хороший дренаж", "Средний дренаж", "Застойное (сырое)"])
 
 st.header("2. Зона расположения поля")
-zone_name = st.selectbox("Агроклиматическая зона (полоса ~100 км)", list(ZONES.keys()))
-zone = ZONES[zone_name]
+zone_id = st.selectbox(
+    "Агроклиматическая зона (полоса ~100 км)",
+    list(ZONES.keys()),
+    format_func=lambda zid: ZONES[zid]["name_ru"],
+)
+zone = ZONES[zone_id]
 with st.expander("Климатические параметры выбранной зоны"):
     st.write(f"- Безморозных дней в среднем: **{zone['безморозные_дни']}**")
     st.write(f"- Вегетационный период: **{zone['вегетационный_период_дни']} дней**")
-    st.write(f"- Осадки за сезон: **{zone['осадки_мм']} мм**")
-    st.write(f"- Средняя температура: **{zone['температура_ср']} °C**")
+    st.write(f"- Осадки за сезон (30-летняя норма): **{zone['осадки_мм']} мм**")
+    st.write(f"- Средняя температура (30-летняя норма): **{zone['температура_ср']} °C**")
+    if "_осадки_10j" in zone:
+        st.write(
+            f"- Для сравнения, 10-летний тренд: **{zone['_осадки_10j']} мм** осадков, "
+            f"**{zone['_температура_10j']} °C**"
+        )
+    if "_kurzfristig_zeitraum" in zone:
+        st.write(
+            f"- Последняя недельная сводка ({zone['_kurzfristig_zeitraum']}): "
+            f"**{zone['_kurzfristig_temperatur']} °C**, "
+            f"**{zone['_kurzfristig_niederschlag']} мм** осадков"
+        )
+    st.caption(f"Источник данных: {zone.get('_datenquelle', 'неизвестно')}")
 
 st.header("3. История севооборота на этом поле")
 st.caption("Укажите, что сеялось в последние годы (оставьте «Не сеялось», если данных нет)")
