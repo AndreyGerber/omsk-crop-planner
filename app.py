@@ -9,6 +9,13 @@ from datetime import date
 import streamlit as st
 import pandas as pd
 
+try:
+    import folium
+    from streamlit_folium import st_folium
+    FOLIUM_AVAILABLE = True
+except ImportError:
+    FOLIUM_AVAILABLE = False
+
 st.set_page_config(page_title="Оптимизация посева — Омская область", layout="wide")
 
 # ---------------------------------------------------------------------------
@@ -36,6 +43,19 @@ ZONE_STATIC = {
         "почвы_типичные": ["Чернозём обыкновенный", "Чернозём южный"],
     },
 }
+
+# Geo-Koordinaten je Zone (Zentroid entspricht scripts/zones.py) plus
+# Breitengrad-Grenzen der ~100-km-Streifen, nur fuer die Kartendarstellung.
+# Grenzen = Mittelpunkte zwischen benachbarten Zentroiden, mit Puffer an
+# den aeusseren Raendern.
+ZONE_MAP_INFO = {
+    "north_taiga": {"lat_center": 57.5, "lon_center": 73.5, "lat_von": 58.25, "lat_bis": 56.75, "farbe": "#2b6cb0"},
+    "north_foreststeppe": {"lat_center": 56.0, "lon_center": 73.5, "lat_von": 56.75, "lat_bis": 55.5, "farbe": "#38a169"},
+    "south_foreststeppe": {"lat_center": 55.0, "lon_center": 73.3, "lat_von": 55.5, "lat_bis": 54.5, "farbe": "#d69e2e"},
+    "steppe": {"lat_center": 54.0, "lon_center": 73.0, "lat_von": 54.5, "lat_bis": 53.5, "farbe": "#dd6b20"},
+}
+MAP_LON_WEST = 70.0
+MAP_LON_EAST = 77.0
 
 # Fallback-Klimawerte, falls noch keine CSV-Daten vorliegen (z.B. vor dem
 # allerersten Workflow-Lauf) — damit die App nie abstürzt, nur mit alten
@@ -143,6 +163,43 @@ def build_zones():
 
 
 ZONES = build_zones()
+
+
+def render_zone_map(selected_zone_id):
+    """Baut eine folium-Karte mit den 4 Klimazonen als farbige Breitengrad-Streifen."""
+    m = folium.Map(
+        location=[55.5, 73.5],
+        zoom_start=6,
+        tiles="OpenStreetMap",
+    )
+
+    for zone_id, info in ZONE_MAP_INFO.items():
+        is_selected = zone_id == selected_zone_id
+        bounds = [
+            [info["lat_bis"], MAP_LON_WEST],
+            [info["lat_von"], MAP_LON_EAST],
+        ]
+        folium.Rectangle(
+            bounds=bounds,
+            color="#e53e3e" if is_selected else info["farbe"],
+            weight=4 if is_selected else 1.5,
+            fill=True,
+            fill_color=info["farbe"],
+            fill_opacity=0.35 if is_selected else 0.15,
+            popup=ZONES[zone_id]["name_ru"],
+            tooltip=ZONES[zone_id]["name_ru"],
+        ).add_to(m)
+
+        folium.Marker(
+            location=[info["lat_center"], info["lon_center"]],
+            tooltip=ZONES[zone_id]["name_ru"],
+            icon=folium.Icon(
+                color="red" if is_selected else "blue",
+                icon="leaf" if is_selected else "info-sign",
+            ),
+        ).add_to(m)
+
+    return m
 
 # Jede Kultur jetzt zusätzlich mit:
 # - необходимая_gdd: ungefähre Wärmesumme (Basis 5°C) bis zur Reife
@@ -456,6 +513,16 @@ zone_id = st.selectbox(
     format_func=lambda zid: ZONES[zid]["name_ru"],
 )
 zone = ZONES[zone_id]
+
+if FOLIUM_AVAILABLE:
+    zone_map = render_zone_map(zone_id)
+    st_folium(zone_map, width=None, height=420, returned_objects=[])
+else:
+    st.info(
+        "ℹ️ Для отображения карты установите дополнительные пакеты: "
+        "`pip install folium streamlit-folium` и перезапустите приложение."
+    )
+
 with st.expander("Климатические параметры выбранной зоны"):
     st.write(f"- Вегетационное окно (по датам заморозков): **{zone['_vegetationsfenster_tage']} дней** "
              f"(с {zone['_letzter_fruehjahrsfrost']} по {zone['_erster_herbstfrost']})")
@@ -498,6 +565,53 @@ st.caption(
     "Настройте, насколько важен каждый параметр при расчёте балла пригодности. "
     "Сумма всех ползунков должна быть ровно 100%."
 )
+
+with st.expander("ℹ️ Как рассчитывается каждый параметр"):
+    param_explanation = pd.DataFrame([
+        {
+            "Параметр": "Тип почвы",
+            "Что измеряет": "Совпадает ли тип почвы поля с подходящими почвами культуры",
+            "Как рассчитывается": "1.0 — точное совпадение; 0.4 — почва не идеальна, но типична для зоны; 0.0 — не подходит",
+            "Источник данных": "Выбор пользователя (шаг 1) + список подходящих почв культуры",
+        },
+        {
+            "Параметр": "pH почвы",
+            "Что измеряет": "Попадает ли pH поля в оптимальный диапазон культуры",
+            "Как рассчитывается": "1.0 — внутри диапазона; при выходе за диапазон балл снижается пропорционально расстоянию",
+            "Источник данных": "Слайдер pH (шаг 1) + диапазон pH_мин/pH_макс культуры",
+        },
+        {
+            "Параметр": "Вегетационное окно",
+            "Что измеряет": "Хватает ли дней между последним весенним и первым осенним заморозком для полного цикла культуры",
+            "Как рассчитывается": "Окно = дата первого осеннего заморозка − дата последнего весеннего заморозка (30-летняя история). Сравнивается с мин. днями роста культуры",
+            "Источник данных": "CSV (даты заморозков, 30J) + мин_дни_роста культуры",
+        },
+        {
+            "Параметр": "Тепловая сумма (GDD)",
+            "Что измеряет": "Хватает ли зоне накопленного тепла для вызревания культуры",
+            "Как рассчитывается": "Growing Degree Days (сумма превышений среднесуточной температуры над 5°C за сезон) зоны сравнивается с потребностью культуры",
+            "Источник данных": "CSV (тепловая сумма, 30J) + необходимая_gdd культуры",
+        },
+        {
+            "Параметр": "Влагообеспеченность",
+            "Что измеряет": "Хватает ли осадков И не слишком ли велик риск длинной засухи",
+            "Как рассчитывается": "Среднее двух под-баллов: (а) осадки зоны (с поправкой на дренаж) vs. потребность культуры, (б) длиннейшая засуха зоны vs. максимальная засухоустойчивость культуры",
+            "Источник данных": "CSV (осадки + засуха, 30J), дренаж (шаг 1) + параметры культуры",
+        },
+        {
+            "Параметр": "Жаростойкость",
+            "Что измеряет": "Выдержит ли культура типичное количество жарких дней (>30°C) в зоне",
+            "Как рассчитывается": "Число жарких дней зоны сравнивается с порогом переносимости культуры (низкая — 3 дня, средняя — 8, высокая — 15)",
+            "Источник данных": "CSV (жаркие дни, 30J) + качественная жаростойкость культуры",
+        },
+        {
+            "Параметр": "Урожайность",
+            "Что измеряет": "Потенциальная урожайность культуры относительно максимума среди всех культур в таблице",
+            "Как рассчитывается": "Урожайность культуры (ц/га) делится на максимальную урожайность среди всех культур — от условий поля/зоны НЕ зависит",
+            "Источник данных": "Справочная таблица культур (фиксированные значения)",
+        },
+    ])
+    st.dataframe(param_explanation, use_container_width=True, hide_index=True)
 
 WEIGHT_KEYS = {
     "почва": "w_soil", "ph": "w_ph", "окно": "w_window", "gdd": "w_gdd",
