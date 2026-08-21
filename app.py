@@ -4,6 +4,7 @@
 """
 
 import os
+import csv
 from datetime import date, timedelta
 
 import streamlit as st
@@ -120,6 +121,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 SHORT_TERM_CSV = os.path.join(REPO_ROOT, "data", "short_term", "weekly_weather.csv")
 LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_trend.csv")
 PER_YEAR_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_per_year_metrics.csv")
+CALIBRATION_CSV = os.path.join(REPO_ROOT, "data", "calibration", "actual_results.csv")
 
 REFERENCE_YEAR_FOR_DOY = 2001  # Nicht-Schaltjahr, nur zur Umrechnung MM-DD -> Tag-des-Jahres
 
@@ -192,6 +194,50 @@ def load_all_per_year(csv_path):
     return result
 
 
+CALIBRATION_FIELDS = [
+    "zone_id", "zone_name", "crop_name", "jahr",
+    "факт_дата_посева", "факт_дата_уборки", "факт_урожайность_ц_га",
+    "заметки", "добавлено",
+]
+
+
+def load_calibration_data():
+    """Lädt alle bisher eingetragenen realen Beobachtungen (kein Caching —
+    soll sofort nach dem Speichern einer neuen Zeile aktuell sein)."""
+    if not os.path.isfile(CALIBRATION_CSV):
+        return pd.DataFrame(columns=CALIBRATION_FIELDS)
+    df = pd.read_csv(CALIBRATION_CSV)
+    return df
+
+
+def save_calibration_entry(entry):
+    """Hängt eine neue reale Beobachtung an die Kalibrierungsdatei an."""
+    os.makedirs(os.path.dirname(CALIBRATION_CSV), exist_ok=True)
+    file_exists = os.path.isfile(CALIBRATION_CSV)
+    with open(CALIBRATION_CSV, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CALIBRATION_FIELDS)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(entry)
+
+
+def get_calibrated_yield(zone_id, crop_name, calibration_df):
+    """
+    Mittelt die tatsächlich eingetragene Urozhaynost für eine Zone/Kultur.
+    Gibt (kalibrierter_wert, anzahl_beobachtungen) zurück, oder (None, 0)
+    falls keine Beobachtungen vorliegen.
+    """
+    if calibration_df.empty:
+        return None, 0
+    subset = calibration_df[
+        (calibration_df["zone_id"] == zone_id) & (calibration_df["crop_name"] == crop_name)
+    ]
+    subset = subset[subset["факт_урожайность_ц_га"].notna()]
+    if subset.empty:
+        return None, 0
+    return round(subset["факт_урожайность_ц_га"].astype(float).mean(), 1), len(subset)
+
+
 def find_analog_years(zone_id, current_frost_doy, current_niederschlag, per_year_data, top_n=3):
     """
     Findet die historischen Jahre, deren Vorsaison-Verlauf (Frosttermin +
@@ -223,10 +269,67 @@ def find_analog_years(zone_id, current_frost_doy, current_niederschlag, per_year
             "saison_hitzetage": r.get("saison_hitzetage"),
             "saison_trockenperiode": r.get("saison_laengste_trockenperiode_tage"),
             "saison_temperatur": r.get("saison_temperatur_mittel_c"),
+            "herbstfrost_doy": r.get("erster_herbstfrost_doy"),
         })
 
     candidates.sort(key=lambda c: c["distanz"])
     return candidates[:top_n]
+
+
+def _doy_to_readable(doy):
+    """Tag-des-Jahres -> lesbares Datum ('DD Monat')."""
+    if doy is None or (isinstance(doy, float) and pd.isna(doy)):
+        return None
+    d = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=round(doy) - 1)
+    return f"{d.day} {RU_MONTHS_GENITIVE[d.month - 1]}"
+
+
+def build_analog_narrative(zone, analog_years):
+    """Baut aus den Analog-Jahren einen lesbaren Fließtext statt einer reinen Stichpunktliste."""
+    if not analog_years:
+        return None
+
+    years_str = ", ".join(str(a["jahr"]) for a in analog_years)
+
+    gdd_vals = [a["saison_gdd"] for a in analog_years if a["saison_gdd"] is not None]
+    heat_vals = [a["saison_hitzetage"] for a in analog_years if a["saison_hitzetage"] is not None]
+    dry_vals = [a["saison_trockenperiode"] for a in analog_years if a["saison_trockenperiode"] is not None]
+    frost_doy_vals = [a["herbstfrost_doy"] for a in analog_years if a.get("herbstfrost_doy") is not None and not pd.isna(a.get("herbstfrost_doy"))]
+
+    avg_gdd = sum(gdd_vals) / len(gdd_vals) if gdd_vals else None
+    avg_heat = sum(heat_vals) / len(heat_vals) if heat_vals else None
+    avg_dry = sum(dry_vals) / len(dry_vals) if dry_vals else None
+    avg_frost_doy = sum(frost_doy_vals) / len(frost_doy_vals) if frost_doy_vals else None
+
+    zone_gdd = zone.get("_gdd")
+    if avg_gdd is not None and zone_gdd:
+        if avg_gdd > zone_gdd * 1.08:
+            charakter = "теплее обычного"
+        elif avg_gdd < zone_gdd * 0.92:
+            charakter = "холоднее обычного"
+        else:
+            charakter = "близко к обычной норме"
+    else:
+        charakter = "неизвестного характера"
+
+    satz = f"Весна этого года по срокам заморозков и осадкам больше всего похожа на {years_str} годы. "
+    satz += f"В эти годы лето было {charakter}"
+    if avg_gdd is not None:
+        satz += f" (в среднем {round(avg_gdd)} GDD"
+        if avg_heat is not None:
+            satz += f", {round(avg_heat)} жарких дней"
+        if avg_dry is not None:
+            satz += f", засуха до {round(avg_dry)} дней подряд"
+        satz += ")"
+    satz += ". "
+
+    frost_readable = _doy_to_readable(avg_frost_doy)
+    if frost_readable:
+        satz += f"Первые осенние заморозки в эти годы приходили примерно **{frost_readable}**."
+    else:
+        satz += "Данных о сроках осенних заморозков в эти годы недостаточно."
+
+    return satz
 
 
 def build_zones():
@@ -515,21 +618,15 @@ RU_MONTHS_GENITIVE = [
 MIN_TAGE_FUER_AKTUELLEN_FROST = 60
 
 
-def estimate_sowing_date(crop_name, zone):
+def _estimate_sowing_doy(crop_name, zone):
     """
-    Schätzt das Saatdatum: озимые -> fester Herbsttext, яровые -> letzter
-    Frühjahrsfrost + kulturspezifischer Versatz in Tagen.
-
-    Nutzt bevorzugt den TATSÄCHLICH BEOBACHTETEN Frost dieses Jahres (aus den
-    Frühjahrs-Tagesdaten), falls das Beobachtungsfenster ausreichend
-    abgeschlossen ist — das macht die Schätzung aktueller als eine reine
-    30-Jahres-Norm. Fällt sonst auf die historische Norm zurück.
+    Interne Hilfsfunktion: liefert (sowing_doy, quelle_hinweis) oder (None, None)
+    falls keine Daten vorliegen. Wird sowohl fuer die Saat- als auch die
+    Ernte-Schaetzung genutzt, damit beide konsistent dieselbe Basis nutzen.
     """
     profile = SOWING_PROFILE.get(crop_name)
-    if profile is None:
-        return "нет данных"
-    if profile["тип_посева"] == "озимый":
-        return "осень (конец августа — сентябрь)"
+    if profile is None or profile["тип_посева"] == "озимый":
+        return None, None
 
     tage_ausgewertet = zone.get("_tage_ausgewertet") or 0
     frost_doy_aktuell = zone.get("_frost_dieses_jahr_doy")
@@ -542,11 +639,74 @@ def estimate_sowing_date(crop_name, zone):
         quelle_hinweis = ""
 
     if frost_doy is None:
+        return None, None
+
+    return frost_doy + profile["смещение_дней"], quelle_hinweis
+
+
+def estimate_sowing_date(crop_name, zone):
+    """
+    Schaetzt das Saatdatum: озимые -> fester Herbsttext, яровые -> letzter
+    Fruehjahrsfrost + kulturspezifischer Versatz in Tagen.
+
+    Nutzt bevorzugt den TATSAECHLICH BEOBACHTETEN Frost dieses Jahres (aus den
+    Fruehjahrs-Tagesdaten), falls das Beobachtungsfenster ausreichend
+    abgeschlossen ist -- das macht die Schaetzung aktueller als eine reine
+    30-Jahres-Norm. Faellt sonst auf die historische Norm zurueck.
+    """
+    profile = SOWING_PROFILE.get(crop_name)
+    if profile is None:
+        return "нет данных"
+    if profile["тип_посева"] == "озимый":
+        return "осень (конец августа — сентябрь)"
+
+    sowing_doy, quelle_hinweis = _estimate_sowing_doy(crop_name, zone)
+    if sowing_doy is None:
         return "нет данных о заморозках"
 
-    sowing_doy = frost_doy + profile["смещение_дней"]
     sowing_date = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=sowing_doy - 1)
     return f"~{sowing_date.day} {RU_MONTHS_GENITIVE[sowing_date.month - 1]}{quelle_hinweis}"
+
+
+def estimate_harvest_window(crop_name, zone):
+    """
+    Schaetzt den Erntezeitraum: Saatdatum + Mindest-Wachstumstage der Kultur.
+    Prueft zusaetzlich, ob die geschaetzte Ernte gefaehrlich nah am (geblendeten)
+    ersten Herbstfrost der Zone liegt -- dann Risikohinweis.
+
+    WICHTIG: Dies ist eine reine Reifezeit-Schaetzung (Saatdatum + Mindesttage).
+    August-September-Wetter wird NICHT separat prognostiziert (dafuer fehlen
+    aktuell eigene Daten) -- fuer die tatsaechliche Befahrbarkeit des Feldes ist
+    zusaetzlich der Draenage-Hinweis unten zu beachten.
+    """
+    crop = CROPS.get(crop_name)
+    profile = SOWING_PROFILE.get(crop_name)
+    if crop is None or profile is None:
+        return {"дата": "нет данных", "риск": False, "риск_текст": ""}
+    if profile["тип_посева"] == "озимый":
+        return {"дата": "лето следующего года (июль)", "риск": False, "риск_текст": ""}
+
+    sowing_doy, _ = _estimate_sowing_doy(crop_name, zone)
+    if sowing_doy is None:
+        return {"дата": "нет данных о заморозках", "риск": False, "риск_текст": ""}
+
+    harvest_doy = sowing_doy + crop["мин_дни_роста"]
+    harvest_date = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=harvest_doy - 1)
+    date_str = f"~{harvest_date.day} {RU_MONTHS_GENITIVE[harvest_date.month - 1]}"
+
+    fall_frost_doy = _md_to_doy(zone.get("_erster_herbstfrost"))
+    risk = False
+    risk_text = ""
+    if fall_frost_doy is not None:
+        zapas_dney = fall_frost_doy - harvest_doy
+        if zapas_dney < 0:
+            risk = True
+            risk_text = f"⚠️ позже обычного первого заморозка ({zone.get('_erster_herbstfrost')})"
+        elif zapas_dney < 10:
+            risk = True
+            risk_text = f"⚠️ близко к обычному заморозку (запас {zapas_dney} дн.)"
+
+    return {"дата": date_str, "риск": risk, "риск_текст": risk_text}
 
 
 SOIL_TYPES_INFO = {
@@ -706,7 +866,7 @@ def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights):
 
     # 7. Урожайный потенциал (0-1, нормировано по максимуму в таблице)
     max_yield = max(c["урожайность_ц_га"] for c in CROPS.values())
-    yield_score = crop["урожайность_ц_га"] / max_yield
+    yield_score = min(1.0, crop["урожайность_ц_га"] / max_yield)
 
     sub_scores = {
         "почва": soil_score,
@@ -814,6 +974,34 @@ else:
         "`pip install folium streamlit-folium` и перезапустите приложение."
     )
 
+# Analog-Jahre-Prognose — bewusst SICHTBAR, nicht in einem eingeklappten
+# Expander versteckt, da das der zentrale "Vorhersage"-Baustein der App ist.
+analog_years = find_analog_years(
+    zone_id,
+    zone.get("_frost_dieses_jahr_doy"),
+    zone.get("_niederschlag_fruehjahr_bisher"),
+    PER_YEAR_DATA,
+)
+if analog_years:
+    st.subheader("🔮 Похожие по погоде годы")
+    narrative = build_analog_narrative(zone, analog_years)
+    if narrative:
+        st.write(narrative)
+    show_analog_details = st.checkbox("Показать детали по похожим годам", key=f"analog_details_{zone_id}")
+    if show_analog_details:
+        for a in analog_years:
+            st.write(
+                f"· **{a['jahr']}** (заморозок {a['vorsaison_frost']}, "
+                f"{a['vorsaison_niederschlag']} мм осадков) "
+                f"→ сезон: GDD {a['saison_gdd']}, жарких дней {a['saison_hitzetage']}, "
+                f"засуха до {a['saison_trockenperiode']} дн."
+            )
+elif "_kurzfristig_zeitraum" in zone:
+    st.info(
+        "ℹ️ Похожих лет не найдено — недостаточно исторических данных для сравнения "
+        "(нужен файл yearly_per_year_metrics.csv с данными по годам)."
+    )
+
 with st.expander("Климатические параметры выбранной зоны"):
     st.caption(
         f"Используемые ниже значения — это взвешенная смесь 10-летнего и "
@@ -869,22 +1057,6 @@ with st.expander("Климатические параметры выбранно
         niederschlag_bisher = zone.get("_niederschlag_fruehjahr_bisher")
         if niederschlag_bisher is not None:
             st.write(f"  - Осадки с начала марта: **{niederschlag_bisher} мм**")
-
-        analog_years = find_analog_years(
-            zone_id,
-            zone.get("_frost_dieses_jahr_doy"),
-            niederschlag_bisher,
-            PER_YEAR_DATA,
-        )
-        if analog_years:
-            st.write("  - **Похожие по началу весны годы** (по факт. данным прошлых лет):")
-            for a in analog_years:
-                st.write(
-                    f"    · **{a['jahr']}** (заморозок {a['vorsaison_frost']}, "
-                    f"{a['vorsaison_niederschlag']} мм) "
-                    f"→ сезон: GDD {a['saison_gdd']}, жарких дней {a['saison_hitzetage']}, "
-                    f"засуха до {a['saison_trockenperiode']} дн."
-                )
     st.caption(f"Источник данных: {zone.get('_datenquelle', 'неизвестно')}")
 
 st.header("3. История севооборота на этом поле")
@@ -1114,17 +1286,98 @@ else:
             st.session_state[session_key] = normalized[weight_key]
         st.rerun()
 
+st.header("5. Калибровка по фактическим данным (опционально)")
+st.caption(
+    "Модель использует справочную урожайность из общей агрономической литературы — "
+    "она НЕ откалибрована под конкретно ваши поля. Здесь можно было бы вносить "
+    "реальные наблюдения за прошлые годы (что сеяли, когда взошло/убрали, какая "
+    "была урожайность), и модель начала бы использовать средний ФАКТИЧЕСКИЙ урожай "
+    "вместо справочного значения."
+)
+st.caption("🔒 Раздел пока отключён (в разработке) — ввод данных недоступен.")
+
+calibration_df = load_calibration_data()
+
+with st.form("calibration_form", clear_on_submit=True):
+    cal_cols = st.columns(4)
+    with cal_cols[0]:
+        cal_zone_id = st.selectbox(
+            "Зона", list(ZONES.keys()), format_func=lambda zid: ZONES[zid]["name_ru"], key="cal_zone", disabled=True
+        )
+    with cal_cols[1]:
+        cal_crop = st.selectbox("Культура", list(CROPS.keys()), key="cal_crop", disabled=True)
+    with cal_cols[2]:
+        cal_year = st.number_input("Год", min_value=1990, max_value=2100, value=date.today().year - 1, step=1, key="cal_year", disabled=True)
+    with cal_cols[3]:
+        cal_yield = st.number_input("Факт. урожайность (ц/га)", min_value=0.0, max_value=200.0, value=20.0, step=0.5, key="cal_yield", disabled=True)
+
+    cal_cols2 = st.columns(3)
+    with cal_cols2[0]:
+        cal_sowing = st.text_input("Факт. дата посева (напр. 12 мая)", key="cal_sowing", disabled=True)
+    with cal_cols2[1]:
+        cal_harvest = st.text_input("Факт. дата уборки (напр. 20 августа)", key="cal_harvest", disabled=True)
+    with cal_cols2[2]:
+        cal_notes = st.text_input("Заметки (необязательно)", key="cal_notes", disabled=True)
+
+    submitted = st.form_submit_button("💾 Сохранить наблюдение", disabled=True)
+    if submitted:
+        save_calibration_entry({
+            "zone_id": cal_zone_id,
+            "zone_name": ZONES[cal_zone_id]["name_ru"],
+            "crop_name": cal_crop,
+            "jahr": int(cal_year),
+            "факт_дата_посева": cal_sowing,
+            "факт_дата_уборки": cal_harvest,
+            "факт_урожайность_ц_га": cal_yield,
+            "заметки": cal_notes,
+            "добавлено": date.today().isoformat(),
+        })
+        st.success(f"Сохранено: {cal_crop}, {ZONES[cal_zone_id]['name_ru']}, {cal_year} год.")
+        st.rerun()
+
+if not calibration_df.empty:
+    with st.expander(f"📋 Внесённые наблюдения ({len(calibration_df)})"):
+        st.dataframe(calibration_df, use_container_width=True, hide_index=True)
+
+    active_overrides = []
+    for (zid, cname), _ in calibration_df.groupby(["zone_id", "crop_name"]):
+        cal_val, n_obs = get_calibrated_yield(zid, cname, calibration_df)
+        if cal_val is not None:
+            справочная = CROPS.get(cname, {}).get("урожайность_ц_га")
+            active_overrides.append({
+                "Зона": ZONES.get(zid, {}).get("name_ru", zid),
+                "Культура": cname,
+                "Справочная урожайность": справочная,
+                "Калиброванная (факт.)": cal_val,
+                "Набл.": n_obs,
+            })
+    if active_overrides:
+        st.write("**Активные калибровки** (используются вместо справочных значений при моделировании):")
+        render_wrapped_table(pd.DataFrame(active_overrides), col_widths_pct=[22, 22, 20, 20, 16])
+
 st.divider()
 
 if st.button("🚀 Начать моделирование", type="primary", disabled=(not weights_valid)):
     results = []
     for crop_name, crop in CROPS.items():
-        s = score_crop(crop_name, crop, zone, soil_type, ph, drainage, user_weights)
+        cal_yield, n_obs = get_calibrated_yield(zone_id, crop_name, calibration_df)
+        if cal_yield is not None:
+            effective_crop = dict(crop)
+            effective_crop["урожайность_ц_га"] = cal_yield
+            urozhay_display = f"{cal_yield} (факт., {n_obs} набл.)"
+        else:
+            effective_crop = crop
+            urozhay_display = f"{crop['урожайность_ц_га']} (справочно)"
+
+        s = score_crop(crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights)
+        harvest = estimate_harvest_window(crop_name, zone)
+        harvest_display = harvest["дата"] + (f" {harvest['риск_текст']}" if harvest["риск"] else "")
         results.append({
             "Культура": crop_name,
             "Балл пригодности": s,
             "Ориентировочный посев": estimate_sowing_date(crop_name, zone),
-            "Урожайность (ц/га, справочно)": crop["урожайность_ц_га"],
+            "Ориентировочная уборка": harvest_display,
+            "Урожайность (ц/га)": urozhay_display,
             "Треб. GDD": crop["необходимая_gdd"],
             "Мин. дней роста": crop["мин_дни_роста"],
             "Жаростойкость": crop["жаростойкость"],
@@ -1140,15 +1393,31 @@ if st.button("🚀 Начать моделирование", type="primary", dis
     blocked_df = ranked_df[ranked_df["Разрешено севооборотом"] == "Нет"]
 
     st.subheader("✅ Рекомендованные культуры (с учётом севооборота)")
-    st.dataframe(allowed_df.drop(columns=["Разрешено севооборотом"]), use_container_width=True, hide_index=True)
+    result_col_widths = [12, 9, 12, 18, 12, 8, 9, 9, 11]  # Summe = 100, "Уборка" breiter wegen Risikohinweis
+    render_wrapped_table(allowed_df.drop(columns=["Разрешено севооборотом"]), col_widths_pct=result_col_widths)
 
     if not blocked_df.empty:
         with st.expander("⛔ Культуры, исключённые из-за севооборота"):
-            st.dataframe(blocked_df.drop(columns=["Разрешено севооборотом"]), use_container_width=True, hide_index=True)
+            render_wrapped_table(blocked_df.drop(columns=["Разрешено севооборотом"]), col_widths_pct=result_col_widths)
 
     st.caption(
         "Балл пригодности рассчитан на основе соответствия почвы, pH, вегетационного окна "
         "(по реальным датам заморозков), тепловой суммы (GDD), водообеспеченности с учётом "
         "риска засухи, жаростойкости и урожайного потенциала. Это прототип — веса и "
         "справочные значения культур подлежат уточнению."
+    )
+
+    drainage_hinweise = {
+        "Хороший дренаж": "поле обычно готово к технике уже через 1-3 дня после дождя — "
+                           "риск задержки уборки из-за переувлажнения почвы минимален.",
+        "Средний дренаж": "после сильных дождей в августе-сентябре дайте полю 1-2 дня на подсыхание "
+                           "перед заездом техники — типично для большинства чернозёмов.",
+        "Застойное (сырое)": "⚠️ при выбранном дренаже вода может застаиваться на несколько дней — "
+                              "закладывайте ЗАПАС в несколько дней сверх расчётной даты уборки, "
+                              "особенно если август-сентябрь окажутся дождливыми.",
+    }
+    st.caption(
+        f"**О готовности поля к технике**: {drainage_hinweise.get(drainage, '')} "
+        "Это общая оценка по типу дренажа — отдельного прогноза погоды на август-сентябрь "
+        "модель пока не строит (данные охватывают только период до начала мая)."
     )

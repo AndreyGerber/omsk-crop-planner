@@ -109,6 +109,35 @@ def _compute_vorsaison_metrics(year_records, year):
     }
 
 
+def _compute_monthly_breakdown(year_records):
+    """
+    Monatliche Niederschlags-/Temperaturaufschlüsselung für EIN Jahr —
+    nicht auf einen festen Zeitraum (z.B. nur August-September) beschränkt,
+    damit später für JEDE Kultur individuell (je nach ihrem geschätzten
+    Erntemonat) geprüft werden kann, wie nass/trocken vergleichbare
+    historische Jahre in genau diesem Monat waren.
+
+    Bewusst auf März-Oktober begrenzt (FETCH_START_MD/FETCH_END_MD) — nicht
+    weil frühere/spätere Monate uninteressant wären, sondern weil sie NICHT
+    für jedes Jahr gleich verlässlich vorliegen: bei mehrjährigen Chunk-
+    Anfragen rutschen Nov-Feb je nach Position im Chunk nur zufällig für
+    manche Jahre mit rein. Für die Anbausaison (März-Oktober) ist die
+    Abdeckung dagegen für JEDES Jahr garantiert vollständig.
+    """
+    by_month = defaultdict(list)
+    for r in year_records:
+        if 3 <= r["date"].month <= 10:  # März-Oktober, siehe FETCH_START_MD/FETCH_END_MD
+            by_month[r["date"].month].append(r)
+
+    result = {}
+    for month, recs in by_month.items():
+        result[month] = {
+            "niederschlag_mm": round(sum(r["precip"] for r in recs), 1),
+            "temperatur_mittel_c": round(sum(r["mean"] for r in recs) / len(recs), 1),
+        }
+    return result
+
+
 def _compute_year_metrics(year_records, year):
     """Berechnet alle Kennzahlen für EIN Kalenderjahr aus dessen Tagesdaten."""
     year_records = sorted(year_records, key=lambda r: r["date"])
@@ -138,6 +167,7 @@ def _compute_year_metrics(year_records, year):
             break
 
     vorsaison = _compute_vorsaison_metrics(year_records, year)
+    monthly = _compute_monthly_breakdown(year_records)
 
     return {
         "gdd": gdd,
@@ -150,6 +180,7 @@ def _compute_year_metrics(year_records, year):
         "first_fall_frost_doy": first_fall_frost.timetuple().tm_yday if first_fall_frost else None,
         "vorsaison_letzter_frost": vorsaison["letzter_frost"],
         "vorsaison_niederschlag_mm": vorsaison["niederschlag_mm"],
+        "monthly": monthly,
     }
 
 
@@ -333,10 +364,51 @@ def _write_per_year_rows(per_year_file, zone_id, zone_name, per_year_metrics, ex
     return len(new_rows)
 
 
+def _write_monthly_rows(monthly_file, zone_id, zone_name, per_year_metrics, existing_keys):
+    """
+    Hängt neue monatliche Zeilen an — Long-Format (eine Zeile pro Monat und
+    Jahr), damit sich JEDER beliebige Monat (nicht nur ein fest verdrahteter
+    August-September-Zeitraum) flexibel abfragen lässt — z.B. um für eine
+    Kultur mit geschätztem Erntemonat "Juli" genau die Juli-Niederschläge
+    vergleichbarer historischer Jahre nachzuschlagen.
+    """
+    file_exists = os.path.isfile(monthly_file)
+    fieldnames = ["zone_id", "zone_name", "jahr", "monat", "niederschlag_mm", "temperatur_mittel_c"]
+
+    new_rows = []
+    for year, m in sorted(per_year_metrics.items()):
+        if m is None or "monthly" not in m:
+            continue
+        key = (zone_id, str(year))
+        if key in existing_keys:
+            continue
+        for month, vals in sorted(m["monthly"].items()):
+            new_rows.append({
+                "zone_id": zone_id,
+                "zone_name": zone_name,
+                "jahr": year,
+                "monat": month,
+                "niederschlag_mm": vals["niederschlag_mm"],
+                "temperatur_mittel_c": vals["temperatur_mittel_c"],
+            })
+
+    if not new_rows:
+        return 0
+
+    with open(monthly_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(new_rows)
+
+    return len(new_rows)
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_file = os.path.join(OUTPUT_DIR, "yearly_climate_trend.csv")
     per_year_file = os.path.join(OUTPUT_DIR, "yearly_per_year_metrics.csv")
+    monthly_file = os.path.join(OUTPUT_DIR, "yearly_monthly_metrics.csv")
     file_exists = os.path.isfile(out_file)
 
     end_year = date.today().year - 1
@@ -354,6 +426,7 @@ def main():
         return
 
     total_per_year_written = 0
+    total_monthly_written = 0
     for i, (zone_id, zone) in enumerate(zones_to_fetch):
         print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (März-Oktober, daraus alle Kennzahlen berechnet)")
         agg_row, per_year_metrics = fetch_zone_climate(zone_id, zone)
@@ -362,6 +435,10 @@ def main():
         n_written = _write_per_year_rows(per_year_file, zone_id, zone["name_ru"], per_year_metrics, existing_per_year_keys)
         total_per_year_written += n_written
         print(f"  {n_written} neue Einzeljahres-Zeilen für {zone_id} gespeichert.")
+
+        n_monthly = _write_monthly_rows(monthly_file, zone_id, zone["name_ru"], per_year_metrics, existing_per_year_keys)
+        total_monthly_written += n_monthly
+        print(f"  {n_monthly} neue Monats-Zeilen für {zone_id} gespeichert.")
 
         if i < len(zones_to_fetch) - 1:
             time.sleep(5)  # kurze Pause zwischen Zonen, zusätzlich zur Pause zwischen Chunks
@@ -378,6 +455,7 @@ def main():
 
     print(f"{len(rows)} Aggregat-Zeilen an {out_file} angehängt.")
     print(f"{total_per_year_written} Einzeljahres-Zeilen insgesamt an {per_year_file} angehängt.")
+    print(f"{total_monthly_written} Monats-Zeilen insgesamt an {monthly_file} angehängt.")
 
 
 if __name__ == "__main__":
