@@ -64,6 +64,7 @@ def _load_daily_data(daily_file):
             rows_by_zone.setdefault(zone_id, []).append({
                 "date": d,
                 "temp": float(row["temperatur_c"]),
+                "temp_min": float(row["temperatur_min_c"]),
                 "precip": float(row["niederschlag_mm"]),
                 "sun": float(row["sonnenstunden"]),
             })
@@ -80,7 +81,7 @@ def _fetch_daily_range(zone, start, end):
         "longitude": zone["lon"],
         "start_date": start.isoformat(),
         "end_date": end.isoformat(),
-        "daily": "temperature_2m_mean,precipitation_sum,sunshine_duration",
+        "daily": "temperature_2m_mean,temperature_2m_min,precipitation_sum,sunshine_duration",
         "timezone": "Asia/Omsk",
     }
     data = fetch_with_retry(ARCHIVE_URL, params, timeout=45)
@@ -91,6 +92,7 @@ def _fetch_daily_range(zone, start, end):
         rows.append({
             "date": date.fromisoformat(day_str),
             "temp": daily["temperature_2m_mean"][i],
+            "temp_min": daily["temperature_2m_min"][i],
             "precip": daily["precipitation_sum"][i],
             "sun": daily["sunshine_duration"][i] / 3600,  # Sekunden -> Stunden
         })
@@ -109,6 +111,7 @@ def _write_daily_rows(daily_file, new_rows_by_zone):
                 "zone_name": zone_name,
                 "date": r["date"].isoformat(),
                 "temperatur_c": round(r["temp"], 1),
+                "temperatur_min_c": round(r["temp_min"], 1),
                 "niederschlag_mm": round(r["precip"], 1),
                 "sonnenstunden": round(r["sun"], 2),
             })
@@ -116,25 +119,64 @@ def _write_daily_rows(daily_file, new_rows_by_zone):
     if not all_new:
         return
 
+    fieldnames = ["zone_id", "zone_name", "date", "temperatur_c", "temperatur_min_c", "niederschlag_mm", "sonnenstunden"]
     with open(daily_file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["zone_id", "zone_name", "date", "temperatur_c", "niederschlag_mm", "sonnenstunden"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         if not file_exists:
             writer.writeheader()
         writer.writerows(all_new)
 
 
-def _compute_aggregate(daily_rows, window_start, effective_end):
-    """Berechnet die Zusammenfassung (Mittel/Summe) aus den lokal gespeicherten Tagesdaten."""
+def _find_last_frost(rows):
+    """Letztes Datum mit Tagesminimum <= 0°C innerhalb der übergebenen Zeilen, oder None."""
+    frost_dates = [r["date"] for r in rows if r["temp_min"] <= 0]
+    return max(frost_dates) if frost_dates else None
+
+
+def _find_warmup_start(rows, threshold=5.0, min_run_days=5):
+    """
+    Erster Tag einer mindestens `min_run_days`-tägigen Serie mit Tagesmittel
+    >= threshold — praktikabler Indikator für "Boden wird bearbeitbar",
+    statt eines bedeutungslosen Durchschnitts über die ganze Periode.
+    """
+    rows_sorted = sorted(rows, key=lambda r: r["date"])
+    run_start = None
+    run_len = 0
+    for r in rows_sorted:
+        if r["temp"] >= threshold:
+            if run_len == 0:
+                run_start = r["date"]
+            run_len += 1
+            if run_len >= min_run_days:
+                return run_start
+        else:
+            run_len = 0
+            run_start = None
+    return None
+
+
+def _compute_indicators(daily_rows, window_start, effective_end):
+    """
+    Berechnet agronomisch sinnvolle Kennzahlen aus den lokal gespeicherten
+    Tagesdaten — statt eines einzelnen Temperaturmittels über die ganze
+    (klimatisch sehr heterogene) Periode, das die eigentliche zeitliche
+    Struktur (Frost -> Tauwetter -> stabile Wärme) verschlucken würde.
+    """
     relevant = [r for r in daily_rows if window_start <= r["date"] <= effective_end]
     if not relevant:
         return None
-    avg_temp = sum(r["temp"] for r in relevant) / len(relevant)
+
+    last_frost = _find_last_frost(relevant)
+    warmup_start = _find_warmup_start(relevant)
     total_precip = sum(r["precip"] for r in relevant)
-    total_sun = sum(r["sun"] for r in relevant)
+    days_covered = (effective_end - window_start).days + 1
+
     return {
-        "temperatur_mittel_c": round(avg_temp, 1),
-        "niederschlag_summe_mm": round(total_precip, 1),
-        "sonnenstunden_summe": round(total_sun, 1),
+        "letzter_beobachteter_frost": last_frost.isoformat() if last_frost else "не наблюдался",
+        "tage_seit_letztem_frost": (effective_end - last_frost).days if last_frost else None,
+        "beginn_stabiler_erwaermung": warmup_start.isoformat() if warmup_start else "ещё не наступило",
+        "niederschlag_summe_mm_bisher": round(total_precip, 1),
+        "tage_ausgewertet": days_covered,
     }
 
 
@@ -191,7 +233,7 @@ def main():
         if window_finished and covered_windows.get(key) == window_end.isoformat():
             continue  # Fenster für dieses Jahr schon final zusammengefasst
 
-        agg = _compute_aggregate(rows_by_zone.get(zone_id, []), window_start, effective_end)
+        agg = _compute_indicators(rows_by_zone.get(zone_id, []), window_start, effective_end)
         if agg is None:
             continue
 
