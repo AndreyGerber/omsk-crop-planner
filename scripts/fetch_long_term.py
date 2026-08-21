@@ -215,17 +215,49 @@ def fetch_zone_climate(zone_id, zone):
     return row
 
 
+def _load_covered_years(out_file):
+    """Liest bestehende Zeilen und gibt {zone_id: zeitraum_30j_bis} zurück,
+    um zu erkennen, ob eine Zone für das aktuelle Jahr bereits erfasst ist."""
+    covered = {}
+    if not os.path.isfile(out_file):
+        return covered
+    with open(out_file, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            zone_id = row.get("zone_id")
+            bis = row.get("zeitraum_30j_bis")
+            if zone_id and bis:
+                covered[zone_id] = bis  # letzte Zeile pro Zone gewinnt (Datei ist chronologisch)
+    return covered
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_file = os.path.join(OUTPUT_DIR, "yearly_climate_trend.csv")
     file_exists = os.path.isfile(out_file)
 
+    end_year = date.today().year - 1
+    covered = _load_covered_years(out_file)
+
     rows = []
-    for i, (zone_id, zone) in enumerate(ZONES.items()):
+    zones_to_fetch = [
+        (zone_id, zone) for zone_id, zone in ZONES.items()
+        if covered.get(zone_id) != str(end_year)
+    ]
+
+    if not zones_to_fetch:
+        print(f"Alle Zonen für {end_year} bereits erfasst — nichts zu tun.")
+        return
+
+    for i, (zone_id, zone) in enumerate(zones_to_fetch):
         print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (April-Oktober, daraus alle Kennzahlen berechnet)")
         rows.append(fetch_zone_climate(zone_id, zone))
-        if i < len(ZONES) - 1:
+        if i < len(zones_to_fetch) - 1:
             time.sleep(5)  # kurze Pause zwischen Zonen, zusätzlich zur Pause zwischen Chunks
+
+    skipped = [zid for zid, _ in ZONES.items() if zid not in [z for z, _ in zones_to_fetch]]
+    for zone_id in skipped:
+        print(f"Zone {zone_id}: {end_year} bereits erfasst, überspringe.")
 
     with open(out_file, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=rows[0].keys())
