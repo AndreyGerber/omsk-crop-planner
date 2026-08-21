@@ -15,11 +15,22 @@ relevante Kennzahlen berechnet und erst danach über 10/30 Jahre gemittelt:
   die Niederschlagssumme
 - Anzahl Hitzetage (>30°C) — Stressindikator, geht in einem Mittelwert unter
 
-Ein einzelner API-Call pro Zone holt Rohdaten von April bis Oktober über den
-vollen 30-Jahres-Zeitraum (breiter als die eigentliche Mai-September-Kernsaison,
-damit auch Frühjahrs-/Herbstfrost außerhalb der Kernsaison erfasst wird).
-Daraus werden alle Kennzahlen pro Jahr berechnet, dann für 10j- und
-30j-Fenster aggregiert.
+ZWEI AUSGABEDATEIEN:
+- yearly_climate_trend.csv: 10j/30j-AGGREGATE je Zone (wie bisher) — für die
+  Trend-Einschätzung (wird wärmer/trockener?) in app.py.
+- yearly_per_year_metrics.csv: EINE ZEILE PRO JAHR UND ZONE mit denselben
+  Kennzahlen, UNAGGREGIERT. Diese Werte wurden intern schon immer berechnet
+  (für die Aggregation), bisher aber verworfen. Jetzt werden sie zusätzlich
+  gespeichert, um in app.py "Analog-Jahre" zu finden: historische Jahre, deren
+  Frühjahrsverlauf dem aktuellen Jahr ähnelt, und deren tatsächlichen
+  Sommerverlauf als Anhaltspunkt zu nutzen — OHNE dafür zusätzliche API-Calls
+  zu brauchen, da dieselben Rohdaten ohnehin schon abgerufen werden.
+
+Ein einzelner API-Call pro Zone (in 10-Jahres-Häppchen) holt Rohdaten von
+März bis Oktober über den vollen 30-Jahres-Zeitraum — März ist bewusst
+inkludiert, damit die "Vorsaison"-Kennzahlen (Frost/Niederschlag bis 7. Mai)
+direkt mit den aktuellen Frühjahrsdaten aus fetch_short_term.py vergleichbar
+sind (dieselbe Fensterdefinition: 1. März – 7. Mai).
 
 Quelle: Open-Meteo Archive API (kostenlos, kein API-Key nötig, Daten ab 1940
 verfügbar über ERA5-Reanalyse).
@@ -40,16 +51,22 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "long_term")
 YEARS_LONG = 30  # WMO-Standard-Klimanormalperiode
 YEARS_SHORT = 10  # kurzfristigerer Trend innerhalb desselben Datensatzes
 
-# Rohdaten-Abfragefenster: breiter als die Kernsaison, damit Frost VOR/NACH
-# der eigentlichen Mai-September-Periode erfasst wird.
-FETCH_START_MD = "04-01"
+# Rohdaten-Abfragefenster: März bis Oktober — deckt sowohl die Vorsaison
+# (Frost-/Erwärmungsbeobachtung, vergleichbar mit fetch_short_term.py) als
+# auch die Kernsaison (Mai-September) und den Herbstfrost ab.
+FETCH_START_MD = "03-01"
 FETCH_END_MD = "10-31"
 
 # Agronomische Kernsaison für GDD/Niederschlag/Hitzetage/Trockenperiode
 CORE_SEASON_MONTHS = (5, 9)
 # Suchfenster für Frost-Ereignisse
-SPRING_FROST_MONTHS = (4, 5)
+SPRING_FROST_MONTHS = (3, 5)
 FALL_FROST_MONTHS = (9, 10)
+
+# Vorsaison-Fenster für den Analog-Jahre-Vergleich — identisch zum Fenster
+# in fetch_short_term.py (1. März – 7. Mai), damit "dieses Jahr bisher" direkt
+# mit jedem historischen Jahr vergleichbar ist.
+VORSAISON_END_MD = "05-07"
 
 BASE_TEMP_GDD = 5.0       # Basistemperatur für Wärmesumme (Getreide-Standard)
 HEAT_THRESHOLD_C = 30.0   # ab dieser Max-Temperatur zählt ein Tag als Hitzetag
@@ -70,7 +87,29 @@ def _longest_dry_spell(records):
     return longest
 
 
-def _compute_year_metrics(year_records):
+def _compute_vorsaison_metrics(year_records, year):
+    """
+    Kennzahlen für das Vorsaison-Fenster (1. März - 7. Mai) EINES Jahres —
+    identisch definiert wie in fetch_short_term.py, für direkte Vergleichbarkeit
+    mit den Daten des laufenden Jahres.
+    """
+    window_end = date(year, 5, 7)
+    window_start = date(year, 3, 1)
+    subset = [r for r in year_records if window_start <= r["date"] <= window_end]
+    if not subset:
+        return {"letzter_frost": None, "niederschlag_mm": None}
+
+    frost_dates = [r["date"] for r in subset if r["min"] <= 0]
+    last_frost = max(frost_dates) if frost_dates else None
+    precip_sum = sum(r["precip"] for r in subset)
+
+    return {
+        "letzter_frost": last_frost,
+        "niederschlag_mm": round(precip_sum, 1),
+    }
+
+
+def _compute_year_metrics(year_records, year):
     """Berechnet alle Kennzahlen für EIN Kalenderjahr aus dessen Tagesdaten."""
     year_records = sorted(year_records, key=lambda r: r["date"])
     core = [r for r in year_records if CORE_SEASON_MONTHS[0] <= r["date"].month <= CORE_SEASON_MONTHS[1]]
@@ -98,6 +137,8 @@ def _compute_year_metrics(year_records):
             first_fall_frost = r["date"]
             break
 
+    vorsaison = _compute_vorsaison_metrics(year_records, year)
+
     return {
         "gdd": gdd,
         "precip_mm": precip_sum,
@@ -107,6 +148,8 @@ def _compute_year_metrics(year_records):
         "temp_mean_c": temp_mean,
         "last_spring_frost_doy": last_spring_frost.timetuple().tm_yday if last_spring_frost else None,
         "first_fall_frost_doy": first_fall_frost.timetuple().tm_yday if first_fall_frost else None,
+        "vorsaison_letzter_frost": vorsaison["letzter_frost"],
+        "vorsaison_niederschlag_mm": vorsaison["niederschlag_mm"],
     }
 
 
@@ -174,6 +217,8 @@ def _fetch_chunk(zone, chunk_start_year, chunk_end_year):
 
 
 def fetch_zone_climate(zone_id, zone):
+    """Holt Rohdaten, berechnet Kennzahlen pro Jahr UND die 10j/30j-Aggregate.
+    Gibt (aggregat_row, per_year_metrics_dict) zurück."""
     end_year = date.today().year - 1  # letztes abgeschlossenes Jahr
     start_year_long = end_year - YEARS_LONG + 1
     start_year_short = end_year - YEARS_SHORT + 1
@@ -192,7 +237,7 @@ def fetch_zone_climate(zone_id, zone):
     for r in records:
         by_year[r["date"].year].append(r)
 
-    per_year_metrics = {year: _compute_year_metrics(recs) for year, recs in by_year.items()}
+    per_year_metrics = {year: _compute_year_metrics(recs, year) for year, recs in by_year.items()}
 
     years_10 = range(start_year_short, end_year + 1)
     years_30 = range(start_year_long, end_year + 1)
@@ -212,7 +257,7 @@ def fetch_zone_climate(zone_id, zone):
     row["zeitraum_30j_bis"] = end_year
     row.update({f"{k}_30j": v for k, v in stats_30y.items()})
 
-    return row
+    return row, per_year_metrics
 
 
 def _load_covered_years(out_file):
@@ -231,13 +276,72 @@ def _load_covered_years(out_file):
     return covered
 
 
+def _load_existing_per_year_keys(per_year_file):
+    """Liest bestehende (zone_id, jahr)-Kombinationen, um Duplikate zu vermeiden."""
+    existing = set()
+    if not os.path.isfile(per_year_file):
+        return existing
+    with open(per_year_file, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            existing.add((row["zone_id"], row["jahr"]))
+    return existing
+
+
+def _write_per_year_rows(per_year_file, zone_id, zone_name, per_year_metrics, existing_keys):
+    """Hängt neue Einzeljahres-Zeilen an — überspringt bereits vorhandene (zone_id, jahr)."""
+    file_exists = os.path.isfile(per_year_file)
+    fieldnames = [
+        "zone_id", "zone_name", "jahr",
+        "vorsaison_letzter_frost", "vorsaison_niederschlag_mm",
+        "letzter_fruehjahrsfrost_doy", "erster_herbstfrost_doy",
+        "saison_gdd", "saison_temperatur_mittel_c", "saison_niederschlag_mm",
+        "saison_hitzetage", "saison_laengste_trockenperiode_tage",
+    ]
+
+    new_rows = []
+    for year, m in sorted(per_year_metrics.items()):
+        if m is None:
+            continue
+        key = (zone_id, str(year))
+        if key in existing_keys:
+            continue
+        new_rows.append({
+            "zone_id": zone_id,
+            "zone_name": zone_name,
+            "jahr": year,
+            "vorsaison_letzter_frost": m["vorsaison_letzter_frost"].isoformat() if m["vorsaison_letzter_frost"] else "",
+            "vorsaison_niederschlag_mm": m["vorsaison_niederschlag_mm"],
+            "letzter_fruehjahrsfrost_doy": m["last_spring_frost_doy"],
+            "erster_herbstfrost_doy": m["first_fall_frost_doy"],
+            "saison_gdd": round(m["gdd"], 1),
+            "saison_temperatur_mittel_c": round(m["temp_mean_c"], 1),
+            "saison_niederschlag_mm": round(m["precip_mm"], 1),
+            "saison_hitzetage": m["heat_days"],
+            "saison_laengste_trockenperiode_tage": m["dry_spell_days"],
+        })
+
+    if not new_rows:
+        return 0
+
+    with open(per_year_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(new_rows)
+
+    return len(new_rows)
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_file = os.path.join(OUTPUT_DIR, "yearly_climate_trend.csv")
+    per_year_file = os.path.join(OUTPUT_DIR, "yearly_per_year_metrics.csv")
     file_exists = os.path.isfile(out_file)
 
     end_year = date.today().year - 1
     covered = _load_covered_years(out_file)
+    existing_per_year_keys = _load_existing_per_year_keys(per_year_file)
 
     rows = []
     zones_to_fetch = [
@@ -249,9 +353,16 @@ def main():
         print(f"Alle Zonen für {end_year} bereits erfasst — nichts zu tun.")
         return
 
+    total_per_year_written = 0
     for i, (zone_id, zone) in enumerate(zones_to_fetch):
-        print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (April-Oktober, daraus alle Kennzahlen berechnet)")
-        rows.append(fetch_zone_climate(zone_id, zone))
+        print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (März-Oktober, daraus alle Kennzahlen berechnet)")
+        agg_row, per_year_metrics = fetch_zone_climate(zone_id, zone)
+        rows.append(agg_row)
+
+        n_written = _write_per_year_rows(per_year_file, zone_id, zone["name_ru"], per_year_metrics, existing_per_year_keys)
+        total_per_year_written += n_written
+        print(f"  {n_written} neue Einzeljahres-Zeilen für {zone_id} gespeichert.")
+
         if i < len(zones_to_fetch) - 1:
             time.sleep(5)  # kurze Pause zwischen Zonen, zusätzlich zur Pause zwischen Chunks
 
@@ -265,7 +376,8 @@ def main():
             writer.writeheader()
         writer.writerows(rows)
 
-    print(f"{len(rows)} Zeilen an {out_file} angehängt.")
+    print(f"{len(rows)} Aggregat-Zeilen an {out_file} angehängt.")
+    print(f"{total_per_year_written} Einzeljahres-Zeilen insgesamt an {per_year_file} angehängt.")
 
 
 if __name__ == "__main__":

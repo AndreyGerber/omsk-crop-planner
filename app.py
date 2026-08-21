@@ -119,8 +119,14 @@ CLIMATE_FALLBACK = {
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 SHORT_TERM_CSV = os.path.join(REPO_ROOT, "data", "short_term", "weekly_weather.csv")
 LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_trend.csv")
+PER_YEAR_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_per_year_metrics.csv")
 
 REFERENCE_YEAR_FOR_DOY = 2001  # Nicht-Schaltjahr, nur zur Umrechnung MM-DD -> Tag-des-Jahres
+
+# Gewichtung beim Verschmelzen von 10-Jahres- und 30-Jahres-Klimawerten:
+# höherer Wert = stärkere Betonung des jüngeren (volatileren, aber
+# aktuelleren) 10-Jahres-Trends gegenüber der stabilen 30-Jahres-Norm.
+TREND_GEWICHT_10J = 0.6
 
 
 def _md_to_doy(md_str):
@@ -132,6 +138,30 @@ def _md_to_doy(md_str):
         return date(REFERENCE_YEAR_FOR_DOY, int(month), int(day)).timetuple().tm_yday
     except (ValueError, TypeError):
         return None
+
+
+def _doy_to_md(doy):
+    """Rechnet einen Tag-des-Jahres zurück in ein 'MM-DD'-Datum um."""
+    if doy is None:
+        return None
+    d = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=round(doy) - 1)
+    return d.strftime("%m-%d")
+
+
+def _blend_trend(val_10j, val_30j, weight_10j=TREND_GEWICHT_10J):
+    """
+    Verschmilzt 10-Jahres- und 30-Jahres-Wert zu einem gewichteten Klimawert,
+    der den aktuellen Trend stärker berücksichtigt als eine reine 30-Jahres-
+    Norm, aber trotzdem nicht komplett auf den volatileren 10-Jahres-Wert
+    springt. Fällt auf den jeweils verfügbaren Wert zurück, falls einer fehlt.
+    """
+    if val_10j is None and val_30j is None:
+        return None
+    if val_10j is None:
+        return val_30j
+    if val_30j is None:
+        return val_10j
+    return round(weight_10j * val_10j + (1 - weight_10j) * val_30j, 2)
 
 
 @st.cache_data(ttl=3600)
@@ -147,6 +177,58 @@ def load_latest_by_zone(csv_path, date_col="abfrage_datum"):
     return latest.set_index("zone_id").to_dict("index")
 
 
+@st.cache_data(ttl=3600)
+def load_all_per_year(csv_path):
+    """Lädt ALLE Einzeljahres-Zeilen (nicht nur die neueste) je Zone,
+    für den Analog-Jahre-Vergleich. Gibt {zone_id: [Zeilen als dict, ...]} zurück."""
+    if not os.path.isfile(csv_path):
+        return {}
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return {}
+    result = {}
+    for zone_id, group in df.groupby("zone_id"):
+        result[zone_id] = group.to_dict("records")
+    return result
+
+
+def find_analog_years(zone_id, current_frost_doy, current_niederschlag, per_year_data, top_n=3):
+    """
+    Findet die historischen Jahre, deren Vorsaison-Verlauf (Frosttermin +
+    Niederschlag bis 7. Mai) dem aktuellen Jahr am ähnlichsten ist, und gibt
+    deren tatsächlichen SAISON-Verlauf (GDD, Hitze, Trockenheit) zurück —
+    als Anhaltspunkt dafür, wie sich Jahre mit einem vergleichbaren Frühling
+    tatsächlich entwickelt haben (statt nur eines abstrakten Klimamittels).
+    """
+    rows = per_year_data.get(zone_id, [])
+    candidates = []
+    for r in rows:
+        frost_doy = _md_to_doy(r["vorsaison_letzter_frost"][5:]) if isinstance(r.get("vorsaison_letzter_frost"), str) and r["vorsaison_letzter_frost"] else None
+        niederschlag = r.get("vorsaison_niederschlag_mm")
+        if frost_doy is None or niederschlag is None or pd.isna(niederschlag):
+            continue
+
+        # Ähnlichkeit: Frosttermin zählt stark (Hauptsignal), Niederschlag
+        # schwächer (Sekundärsignal) — Werte normiert auf vergleichbare Skala.
+        frost_diff = abs(frost_doy - current_frost_doy) if current_frost_doy is not None else 0
+        niederschlag_diff = abs(niederschlag - current_niederschlag) / 10 if current_niederschlag is not None else 0
+        distanz = frost_diff * 2 + niederschlag_diff
+
+        candidates.append({
+            "jahr": int(r["jahr"]),
+            "distanz": distanz,
+            "vorsaison_frost": r["vorsaison_letzter_frost"],
+            "vorsaison_niederschlag": niederschlag,
+            "saison_gdd": r.get("saison_gdd"),
+            "saison_hitzetage": r.get("saison_hitzetage"),
+            "saison_trockenperiode": r.get("saison_laengste_trockenperiode_tage"),
+            "saison_temperatur": r.get("saison_temperatur_mittel_c"),
+        })
+
+    candidates.sort(key=lambda c: c["distanz"])
+    return candidates[:top_n]
+
+
 def build_zones():
     """Kombiniert statische Metadaten mit den neuesten CSV-Klimadaten (30j-Basis)."""
     long_term = load_latest_by_zone(LONG_TERM_CSV)
@@ -159,25 +241,65 @@ def build_zones():
         fb = CLIMATE_FALLBACK[zone_id]
 
         if lt is not None and "waermesumme_gdd_mittel_30j" in lt:
-            zone["осадки_мм"] = lt["niederschlag_mittel_pro_saison_mm_30j"]
-            zone["температура_ср"] = lt["temperatur_mittel_c_30j"]
-            zone["_gdd"] = lt["waermesumme_gdd_mittel_30j"]
-            zone["_trockenperiode"] = lt["laengste_trockenperiode_tage_mittel_30j"]
-            zone["_hitzetage"] = lt["hitzetage_ueber_30c_mittel_30j"]
+            # Rohwerte 30j (stabile Klimanorm) und 10j (aktuellerer Trend) getrennt einlesen
+            osadki_30j = lt["niederschlag_mittel_pro_saison_mm_30j"]
+            temp_30j = lt["temperatur_mittel_c_30j"]
+            gdd_30j = lt["waermesumme_gdd_mittel_30j"]
+            trocken_30j = lt["laengste_trockenperiode_tage_mittel_30j"]
+            hitze_30j = lt["hitzetage_ueber_30c_mittel_30j"]
+            spring_doy_30j = _md_to_doy(lt.get("letzter_fruehjahrsfrost_datum_approx_30j"))
+            fall_doy_30j = _md_to_doy(lt.get("erster_herbstfrost_datum_approx_30j"))
 
-            spring_doy = _md_to_doy(lt.get("letzter_fruehjahrsfrost_datum_approx_30j"))
-            fall_doy = _md_to_doy(lt.get("erster_herbstfrost_datum_approx_30j"))
-            if spring_doy is not None and fall_doy is not None:
-                zone["_vegetationsfenster_tage"] = fall_doy - spring_doy
+            osadki_10j = lt.get("niederschlag_mittel_pro_saison_mm_10j")
+            temp_10j = lt.get("temperatur_mittel_c_10j")
+            gdd_10j = lt.get("waermesumme_gdd_mittel_10j")
+            trocken_10j = lt.get("laengste_trockenperiode_tage_mittel_10j")
+            hitze_10j = lt.get("hitzetage_ueber_30c_mittel_10j")
+            spring_doy_10j = _md_to_doy(lt.get("letzter_fruehjahrsfrost_datum_approx_10j"))
+            fall_doy_10j = _md_to_doy(lt.get("erster_herbstfrost_datum_approx_10j"))
+
+            # Geblendete Werte (Trend-Gewichtung) als OFFIZIELLE Werte fürs Scoring —
+            # statt reiner 30-Jahres-Norm wird der jüngere 10-Jahres-Trend stärker
+            # einbezogen (siehe TREND_GEWICHT_10J).
+            zone["осадки_мм"] = _blend_trend(osadki_10j, osadki_30j)
+            zone["температура_ср"] = _blend_trend(temp_10j, temp_30j)
+            zone["_gdd"] = _blend_trend(gdd_10j, gdd_30j)
+            zone["_trockenperiode"] = _blend_trend(trocken_10j, trocken_30j)
+            zone["_hitzetage"] = _blend_trend(hitze_10j, hitze_30j)
+
+            spring_doy_blend = _blend_trend(spring_doy_10j, spring_doy_30j)
+            fall_doy_blend = _blend_trend(fall_doy_10j, fall_doy_30j)
+            if spring_doy_blend is not None and fall_doy_blend is not None:
+                zone["_vegetationsfenster_tage"] = round(fall_doy_blend - spring_doy_blend)
+                zone["_letzter_fruehjahrsfrost"] = _doy_to_md(spring_doy_blend)
+                zone["_erster_herbstfrost"] = _doy_to_md(fall_doy_blend)
             else:
                 zone["_vegetationsfenster_tage"] = fb["vegetationsfenster_tage"]
-            zone["_letzter_fruehjahrsfrost"] = lt.get("letzter_fruehjahrsfrost_datum_approx_30j", "неизвестно")
-            zone["_erster_herbstfrost"] = lt.get("erster_herbstfrost_datum_approx_30j", "неизвестно")
+                zone["_letzter_fruehjahrsfrost"] = lt.get("letzter_fruehjahrsfrost_datum_approx_30j", "неизвестно")
+                zone["_erster_herbstfrost"] = lt.get("erster_herbstfrost_datum_approx_30j", "неизвестно")
 
-            zone["_osadki_10j"] = lt.get("niederschlag_mittel_pro_saison_mm_10j")
-            zone["_temperatura_10j"] = lt.get("temperatur_mittel_c_10j")
-            zone["_gdd_10j"] = lt.get("waermesumme_gdd_mittel_10j")
-            zone["_datenquelle"] = f"CSV (30J: {lt['zeitraum_30j_von']}–{lt['zeitraum_30j_bis']})"
+            # Rohe 30j/10j-Werte weiterhin separat für Anzeige & Trend-Transparenz aufheben
+            zone["_осадки_30j"] = osadki_30j
+            zone["_температура_30j"] = temp_30j
+            zone["_gdd_30j"] = gdd_30j
+            zone["_osadki_10j"] = osadki_10j
+            zone["_temperatura_10j"] = temp_10j
+            zone["_gdd_10j"] = gdd_10j
+
+            # Trend-Richtung/-Stärke für Transparenz in der UI
+            if temp_10j is not None:
+                zone["_temp_trend_delta"] = round(temp_10j - temp_30j, 1)
+            else:
+                zone["_temp_trend_delta"] = None
+            if osadki_10j is not None:
+                zone["_osadki_trend_delta"] = round(osadki_10j - osadki_30j, 1)
+            else:
+                zone["_osadki_trend_delta"] = None
+
+            zone["_datenquelle"] = (
+                f"CSV (Trend-Blend {int(TREND_GEWICHT_10J*100)}%×10J + {int((1-TREND_GEWICHT_10J)*100)}%×30J; "
+                f"30J-Basis: {lt['zeitraum_30j_von']}–{lt['zeitraum_30j_bis']})"
+            )
         else:
             zone["осадки_мм"] = fb["осадки_мм"]
             zone["температура_ср"] = fb["температура_ср"]
@@ -191,15 +313,33 @@ def build_zones():
 
         st_data = short_term.get(zone_id)
         if st_data is not None:
-            zone["_kurzfristig_temperatur"] = st_data["temperatur_mittel_c"]
-            zone["_kurzfristig_niederschlag"] = st_data["niederschlag_summe_mm"]
             zone["_kurzfristig_zeitraum"] = f"{st_data['zeitraum_von']} – {st_data['zeitraum_bis']}"
+            zone["_niederschlag_fruehjahr_bisher"] = st_data.get("niederschlag_summe_mm_bisher")
+            zone["_tage_ausgewertet"] = int(st_data["tage_ausgewertet"]) if st_data.get("tage_ausgewertet") else None
+            zone["_erwaermung_beginn_dieses_jahr"] = st_data.get("beginn_stabiler_erwaermung")
+
+            frost_str = st_data.get("letzter_beobachteter_frost")
+            if frost_str and frost_str != "не наблюдался":
+                zone["_frost_dieses_jahr"] = frost_str
+                zone["_frost_dieses_jahr_doy"] = _md_to_doy(frost_str[5:])  # "YYYY-MM-DD" -> "MM-DD"
+                zone["_tage_seit_frost"] = st_data.get("tage_seit_letztem_frost")
+            else:
+                zone["_frost_dieses_jahr"] = "не наблюдался"
+                zone["_frost_dieses_jahr_doy"] = None
+
+            # Abweichung ggü. 30-jähriger Norm berechnen, wenn beides vorliegt
+            norm_doy = _md_to_doy(zone.get("_letzter_fruehjahrsfrost"))
+            if zone.get("_frost_dieses_jahr_doy") is not None and norm_doy is not None:
+                zone["_frost_abweichung_tage"] = zone["_frost_dieses_jahr_doy"] - norm_doy
+            else:
+                zone["_frost_abweichung_tage"] = None
 
         zones[zone_id] = zone
     return zones
 
 
 ZONES = build_zones()
+PER_YEAR_DATA = load_all_per_year(PER_YEAR_CSV)
 
 
 def render_zone_map(selected_zone_id):
@@ -369,24 +509,44 @@ RU_MONTHS_GENITIVE = [
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ]
 
+# Ab wie vielen ausgewerteten Tagen (von insgesamt 68 im Fenster 1.3.-7.5.)
+# gilt der beobachtete Frost dieses Jahres als verlässlich genug, um die
+# 30-jährige Norm zu ersetzen, statt nur als vorläufige Teilbeobachtung.
+MIN_TAGE_FUER_AKTUELLEN_FROST = 60
+
 
 def estimate_sowing_date(crop_name, zone):
-    """Schätzt das Saatdatum: озимые -> fester Herbsttext, яровые -> letzter
-    Frühjahrsfrost der Zone + kulturspezifischer Versatz in Tagen."""
+    """
+    Schätzt das Saatdatum: озимые -> fester Herbsttext, яровые -> letzter
+    Frühjahrsfrost + kulturspezifischer Versatz in Tagen.
+
+    Nutzt bevorzugt den TATSÄCHLICH BEOBACHTETEN Frost dieses Jahres (aus den
+    Frühjahrs-Tagesdaten), falls das Beobachtungsfenster ausreichend
+    abgeschlossen ist — das macht die Schätzung aktueller als eine reine
+    30-Jahres-Norm. Fällt sonst auf die historische Norm zurück.
+    """
     profile = SOWING_PROFILE.get(crop_name)
     if profile is None:
         return "нет данных"
     if profile["тип_посева"] == "озимый":
         return "осень (конец августа — сентябрь)"
 
-    frost_md = zone.get("_letzter_fruehjahrsfrost")
-    frost_doy = _md_to_doy(frost_md)
+    tage_ausgewertet = zone.get("_tage_ausgewertet") or 0
+    frost_doy_aktuell = zone.get("_frost_dieses_jahr_doy")
+
+    if frost_doy_aktuell is not None and tage_ausgewertet >= MIN_TAGE_FUER_AKTUELLEN_FROST:
+        frost_doy = frost_doy_aktuell
+        quelle_hinweis = " (по факт. заморозку этого года)"
+    else:
+        frost_doy = _md_to_doy(zone.get("_letzter_fruehjahrsfrost"))
+        quelle_hinweis = ""
+
     if frost_doy is None:
         return "нет данных о заморозках"
 
     sowing_doy = frost_doy + profile["смещение_дней"]
     sowing_date = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=sowing_doy - 1)
-    return f"~{sowing_date.day} {RU_MONTHS_GENITIVE[sowing_date.month - 1]}"
+    return f"~{sowing_date.day} {RU_MONTHS_GENITIVE[sowing_date.month - 1]}{quelle_hinweis}"
 
 
 SOIL_TYPES_INFO = {
@@ -655,24 +815,76 @@ else:
     )
 
 with st.expander("Климатические параметры выбранной зоны"):
-    st.write(f"- Вегетационное окно (по датам заморозков): **{zone['_vegetationsfenster_tage']} дней** "
+    st.caption(
+        f"Используемые ниже значения — это взвешенная смесь 10-летнего и "
+        f"30-летнего периодов ({int(TREND_GEWICHT_10J*100)}% / {int((1-TREND_GEWICHT_10J)*100)}%), "
+        f"чтобы учитывать актуальный климатический тренд, а не только "
+        f"устаревшую многолетнюю норму."
+    )
+    st.write(f"- Вегетационное окно: **{zone['_vegetationsfenster_tage']} дней** "
              f"(с {zone['_letzter_fruehjahrsfrost']} по {zone['_erster_herbstfrost']})")
-    st.write(f"- Осадки за сезон (30-летняя норма): **{zone['осадки_мм']} мм**")
-    st.write(f"- Средняя температура (30-летняя норма): **{zone['температура_ср']} °C**")
+    st.write(f"- Осадки за сезон: **{zone['осадки_мм']} мм**")
+    st.write(f"- Средняя температура: **{zone['температура_ср']} °C**")
     st.write(f"- Тепловая сумма (GDD, база 5°C): **{zone['_gdd']}**")
     st.write(f"- Длиннейшая засуха в среднем: **{zone['_trockenperiode']} дней подряд**")
     st.write(f"- Жарких дней (>30°C) в среднем: **{zone['_hitzetage']}**")
-    if "_osadki_10j" in zone and zone["_osadki_10j"] is not None:
+    if zone.get("_osadki_30j") is not None:
         st.write(
-            f"- Для сравнения, 10-летний тренд: **{zone['_osadki_10j']} мм** осадков, "
-            f"**{zone['_temperatura_10j']} °C**, GDD **{zone['_gdd_10j']}**"
+            f"- Исходные значения — 30-летняя норма: **{zone['_температура_30j']} °C**, "
+            f"**{zone['_осадки_30j']} мм**, GDD **{zone['_gdd_30j']}**"
+        )
+    if "_osadki_10j" in zone and zone["_osadki_10j"] is not None:
+        trend_temp = zone.get("_temp_trend_delta")
+        trend_text = ""
+        if trend_temp is not None:
+            if trend_temp > 0:
+                trend_text = f" (тренд: теплее на {trend_temp}°C за 10 лет)"
+            elif trend_temp < 0:
+                trend_text = f" (тренд: холоднее на {abs(trend_temp)}°C за 10 лет)"
+            else:
+                trend_text = " (без изменений)"
+        st.write(
+            f"- Исходные значения — 10-летний тренд: **{zone['_temperatura_10j']} °C**, "
+            f"**{zone['_osadki_10j']} мм**, GDD **{zone['_gdd_10j']}**{trend_text}"
         )
     if "_kurzfristig_zeitraum" in zone:
         st.write(
-            f"- Последняя недельная сводка ({zone['_kurzfristig_zeitraum']}): "
-            f"**{zone['_kurzfristig_temperatur']} °C**, "
-            f"**{zone['_kurzfristig_niederschlag']} мм** осадков"
+            f"- Данные текущей весны ({zone['_kurzfristig_zeitraum']}, "
+            f"{zone.get('_tage_ausgewertet', '?')} дней учтено):"
         )
+        if zone.get("_frost_dieses_jahr") == "не наблюдался":
+            st.write("  - Заморозков в отслеживаемый период не зафиксировано")
+        elif zone.get("_frost_dieses_jahr"):
+            st.write(f"  - Последний фактический заморозок: **{zone['_frost_dieses_jahr']}**")
+            abweichung = zone.get("_frost_abweichung_tage")
+            if abweichung is not None and abweichung > 0:
+                st.write(f"    \u2192 на **{abweichung} дн. позже** 30-летней нормы")
+            elif abweichung is not None and abweichung < 0:
+                st.write(f"    \u2192 на **{abs(abweichung)} дн. раньше** 30-летней нормы")
+            elif abweichung == 0:
+                st.write("    \u2192 совпадает с 30-летней нормой")
+        erwaermung = zone.get("_erwaermung_beginn_dieses_jahr")
+        if erwaermung not in (None, "ещё не наступило"):
+            st.write(f"  - Начало устойчивого потепления (\u22655°C, 5+ дней подряд): **{erwaermung}**")
+        niederschlag_bisher = zone.get("_niederschlag_fruehjahr_bisher")
+        if niederschlag_bisher is not None:
+            st.write(f"  - Осадки с начала марта: **{niederschlag_bisher} мм**")
+
+        analog_years = find_analog_years(
+            zone_id,
+            zone.get("_frost_dieses_jahr_doy"),
+            niederschlag_bisher,
+            PER_YEAR_DATA,
+        )
+        if analog_years:
+            st.write("  - **Похожие по началу весны годы** (по факт. данным прошлых лет):")
+            for a in analog_years:
+                st.write(
+                    f"    · **{a['jahr']}** (заморозок {a['vorsaison_frost']}, "
+                    f"{a['vorsaison_niederschlag']} мм) "
+                    f"→ сезон: GDD {a['saison_gdd']}, жарких дней {a['saison_hitzetage']}, "
+                    f"засуха до {a['saison_trockenperiode']} дн."
+                )
     st.caption(f"Источник данных: {zone.get('_datenquelle', 'неизвестно')}")
 
 st.header("3. История севооборота на этом поле")
