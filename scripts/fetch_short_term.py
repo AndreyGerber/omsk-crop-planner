@@ -1,17 +1,26 @@
 """
-Abfrage der Frühjahrswetterlage vor der Aussaat, je Zone.
-Wird per GitHub Actions Cron einmal pro Woche ausgeführt (siehe
-.github/workflows/weekly_weather.yml).
+Abfrage der Frühjahrswetterlage vor der Aussaat, je Zone — mit TAGESGENAUER
+Auflösung, nicht nur einem einzigen Durchschnittswert über die ganze Periode.
 
-Es wird jetzt IMMER das Fenster vom 1. März bis zum Ende der
-ersten Mai-Woche DES LAUFENDEN JAHRES abgefragt — also die tatsächliche
-Vorsaison-Wetterlage, die für die Aussaatentscheidung zählt:
-- Vor Fensterende (aktuell im Frühjahr): das Fenster wächst wöchentlich mit,
-  bis einschließlich "heute" (Teildaten der laufenden Saison).
-- Nach Fensterende (z.B. im Sommer/Herbst): das abgeschlossene Frühjahrsfenster
-  dieses Jahres wird EINMALIG festgehalten; weitere wöchentliche Läufe
-  überspringen die Abfrage, bis am 1. März des nächsten Jahres ein neues
-  Fenster beginnt (kein sinnloses Neu-Abfragen bereits abgeschlossener Daten).
+WARUM TAGESAUFLÖSUNG: Im Frühjahr ändern sich die Bedingungen (Tauwetter,
+Kälterückfälle) oft innerhalb weniger Tage. Selbst ein Wochenmittel kann
+einen kurzen Kälteeinbruch mitten in einer Tauperiode komplett verschlucken.
+Die Open-Meteo-API liefert ohnehin Tageswerte — wir speichern sie jetzt
+direkt, statt sie sofort zu einem einzigen Mittelwert zu verdichten.
+
+ZWEI DATEIEN:
+- data/short_term/daily_spring_weather.csv: EINE ZEILE PRO TAG UND ZONE,
+  volle Auflösung. Wächst inkrementell — jede Woche werden nur die seit dem
+  letzten Lauf neu vergangenen Tage angehängt (kein Neuabruf bereits
+  gespeicherter Tage).
+- data/short_term/weekly_weather.csv: kompakte Zusammenfassung (Mittelwert
+  Temperatur, Summe Niederschlag/Sonnenstunden über das bisherige Fenster),
+  berechnet AUS den lokal gespeicherten Tagesdaten (kein zusätzlicher
+  API-Call nötig) — für schnelle Übersicht in der App.
+
+FENSTER: 1. März bis Ende der ersten Mai-Woche (7. Mai) DES LAUFENDEN JAHRES.
+Vor Fensterende wächst es wöchentlich mit; danach ist es fest eingefroren
+und weitere Läufe überspringen die Abfrage bis zum 1. März des Folgejahres.
 
 Quelle: Open-Meteo Archive API (kostenlos, kein API-Key nötig).
 https://open-meteo.com/en/docs/historical-weather-api
@@ -19,7 +28,7 @@ https://open-meteo.com/en/docs/historical-weather-api
 
 import os
 import csv
-from datetime import date
+from datetime import date, timedelta
 
 from zones import ZONES
 from fetch_utils import fetch_with_retry
@@ -27,7 +36,6 @@ from fetch_utils import fetch_with_retry
 ARCHIVE_URL = "https://archive-api.open-meteo.com/v1/archive"
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "short_term")
 
-# Vorsaison-Fenster: 1. März bis Ende der ersten Mai-Woche (vereinfacht: 7. Mai)
 WINDOW_START_MD = "03-01"
 WINDOW_END_MD = "05-07"
 
@@ -38,20 +46,35 @@ def _get_window_for_year(year):
     return start, end
 
 
-def _load_existing_rows(out_file):
-    """Liest bestehende Zeilen, um bereits vollständig erfasste Fenster zu erkennen."""
-    existing = {}
-    if not os.path.isfile(out_file):
-        return existing
-    with open(out_file, newline="", encoding="utf-8") as f:
+def _load_daily_data(daily_file):
+    """Liest die bestehende Tagesdaten-CSV. Gibt zurück:
+    - rows_by_zone: {zone_id: [ {date, temp, precip, sun}, ... ]}
+    - last_date_by_zone: {zone_id: letztes gespeichertes Datum als date-Objekt}
+    """
+    rows_by_zone = {}
+    last_date_by_zone = {}
+    if not os.path.isfile(daily_file):
+        return rows_by_zone, last_date_by_zone
+
+    with open(daily_file, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            key = (row["zone_id"], row["zeitraum_von"])
-            existing[key] = row["zeitraum_bis"]
-    return existing
+            zone_id = row["zone_id"]
+            d = date.fromisoformat(row["date"])
+            rows_by_zone.setdefault(zone_id, []).append({
+                "date": d,
+                "temp": float(row["temperatur_c"]),
+                "precip": float(row["niederschlag_mm"]),
+                "sun": float(row["sonnenstunden"]),
+            })
+            if zone_id not in last_date_by_zone or d > last_date_by_zone[zone_id]:
+                last_date_by_zone[zone_id] = d
+
+    return rows_by_zone, last_date_by_zone
 
 
-def fetch_zone_period(zone_id, zone, start, end):
+def _fetch_daily_range(zone, start, end):
+    """Holt Tageswerte für [start, end] und gibt eine Liste von Tages-Dicts zurück."""
     params = {
         "latitude": zone["lat"],
         "longitude": zone["lon"],
@@ -60,30 +83,76 @@ def fetch_zone_period(zone_id, zone, start, end):
         "daily": "temperature_2m_mean,precipitation_sum,sunshine_duration",
         "timezone": "Asia/Omsk",
     }
-
     data = fetch_with_retry(ARCHIVE_URL, params, timeout=45)
     daily = data["daily"]
 
-    avg_temp = sum(daily["temperature_2m_mean"]) / len(daily["temperature_2m_mean"])
-    total_precip = sum(daily["precipitation_sum"])
-    total_sunshine_h = sum(daily["sunshine_duration"]) / 3600  # Sekunden -> Stunden
+    rows = []
+    for i, day_str in enumerate(daily["time"]):
+        rows.append({
+            "date": date.fromisoformat(day_str),
+            "temp": daily["temperature_2m_mean"][i],
+            "precip": daily["precipitation_sum"][i],
+            "sun": daily["sunshine_duration"][i] / 3600,  # Sekunden -> Stunden
+        })
+    return rows
 
+
+def _write_daily_rows(daily_file, new_rows_by_zone):
+    """Hängt neue Tageszeilen an die Tagesdaten-CSV an."""
+    file_exists = os.path.isfile(daily_file)
+    all_new = []
+    for zone_id, rows in new_rows_by_zone.items():
+        zone_name = ZONES[zone_id]["name_ru"]
+        for r in rows:
+            all_new.append({
+                "zone_id": zone_id,
+                "zone_name": zone_name,
+                "date": r["date"].isoformat(),
+                "temperatur_c": round(r["temp"], 1),
+                "niederschlag_mm": round(r["precip"], 1),
+                "sonnenstunden": round(r["sun"], 2),
+            })
+
+    if not all_new:
+        return
+
+    with open(daily_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["zone_id", "zone_name", "date", "temperatur_c", "niederschlag_mm", "sonnenstunden"])
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(all_new)
+
+
+def _compute_aggregate(daily_rows, window_start, effective_end):
+    """Berechnet die Zusammenfassung (Mittel/Summe) aus den lokal gespeicherten Tagesdaten."""
+    relevant = [r for r in daily_rows if window_start <= r["date"] <= effective_end]
+    if not relevant:
+        return None
+    avg_temp = sum(r["temp"] for r in relevant) / len(relevant)
+    total_precip = sum(r["precip"] for r in relevant)
+    total_sun = sum(r["sun"] for r in relevant)
     return {
-        "abfrage_datum": date.today().isoformat(),
-        "zeitraum_von": start.isoformat(),
-        "zeitraum_bis": end.isoformat(),
-        "zone_id": zone_id,
-        "zone_name": zone["name_ru"],
         "temperatur_mittel_c": round(avg_temp, 1),
         "niederschlag_summe_mm": round(total_precip, 1),
-        "sonnenstunden_summe": round(total_sunshine_h, 1),
+        "sonnenstunden_summe": round(total_sun, 1),
     }
+
+
+def _load_covered_windows(weekly_file):
+    covered = {}
+    if not os.path.isfile(weekly_file):
+        return covered
+    with open(weekly_file, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            covered[(row["zone_id"], row["zeitraum_von"])] = row["zeitraum_bis"]
+    return covered
 
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_file = os.path.join(OUTPUT_DIR, "weekly_weather.csv")
-    file_exists = os.path.isfile(out_file)
+    daily_file = os.path.join(OUTPUT_DIR, "daily_spring_weather.csv")
+    weekly_file = os.path.join(OUTPUT_DIR, "weekly_weather.csv")
 
     today = date.today()
     current_year = today.year
@@ -91,28 +160,60 @@ def main():
     effective_end = min(today, window_end)
     window_finished = effective_end >= window_end
 
-    existing = _load_existing_rows(out_file)
+    rows_by_zone, last_date_by_zone = _load_daily_data(daily_file)
+    covered_windows = _load_covered_windows(weekly_file)
 
-    rows = []
+    new_rows_by_zone = {}
+    for zone_id, zone in ZONES.items():
+        last_date = last_date_by_zone.get(zone_id)
+        fetch_from = window_start if last_date is None else last_date + timedelta(days=1)
+
+        if fetch_from > effective_end:
+            print(f"Zone {zone_id}: keine neuen Tage seit letztem Lauf, überspringe Abruf.")
+            continue
+
+        print(f"Hole Tagesdaten {fetch_from}–{effective_end} für Zone {zone_id}")
+        new_rows = _fetch_daily_range(zone, fetch_from, effective_end)
+        new_rows_by_zone[zone_id] = new_rows
+        rows_by_zone.setdefault(zone_id, []).extend(new_rows)
+
+    if new_rows_by_zone:
+        _write_daily_rows(daily_file, new_rows_by_zone)
+        total_new = sum(len(r) for r in new_rows_by_zone.values())
+        print(f"{total_new} neue Tageszeilen an {daily_file} angehängt.")
+    else:
+        print("Keine neuen Tagesdaten — daily_spring_weather.csv unverändert.")
+
+    # Zusammenfassung (weekly_weather.csv) aus den (jetzt aktuellen) Tagesdaten berechnen
+    summary_rows = []
     for zone_id, zone in ZONES.items():
         key = (zone_id, window_start.isoformat())
-        if window_finished and existing.get(key) == window_end.isoformat():
-            print(f"Zone {zone_id}: Frühjahrsfenster {current_year} bereits vollständig erfasst, überspringe.")
+        if window_finished and covered_windows.get(key) == window_end.isoformat():
+            continue  # Fenster für dieses Jahr schon final zusammengefasst
+
+        agg = _compute_aggregate(rows_by_zone.get(zone_id, []), window_start, effective_end)
+        if agg is None:
             continue
-        print(f"Hole Vorsaison-Daten {window_start}–{effective_end} für Zone {zone_id}")
-        rows.append(fetch_zone_period(zone_id, zone, window_start, effective_end))
 
-    if not rows:
-        print("Keine neuen Daten — nichts zu schreiben.")
-        return
+        summary_rows.append({
+            "abfrage_datum": today.isoformat(),
+            "zeitraum_von": window_start.isoformat(),
+            "zeitraum_bis": effective_end.isoformat(),
+            "zone_id": zone_id,
+            "zone_name": zone["name_ru"],
+            **agg,
+        })
 
-    with open(out_file, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=rows[0].keys())
-        if not file_exists:
-            writer.writeheader()
-        writer.writerows(rows)
-
-    print(f"{len(rows)} Zeilen an {out_file} angehängt.")
+    if summary_rows:
+        weekly_file_exists = os.path.isfile(weekly_file)
+        with open(weekly_file, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=summary_rows[0].keys())
+            if not weekly_file_exists:
+                writer.writeheader()
+            writer.writerows(summary_rows)
+        print(f"{len(summary_rows)} Zusammenfassungs-Zeilen an {weekly_file} angehängt.")
+    else:
+        print("Keine neue Zusammenfassung nötig.")
 
 
 if __name__ == "__main__":
