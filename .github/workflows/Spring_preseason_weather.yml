@@ -1,0 +1,35 @@
+name: Spring pre-season weather fetch
+
+on:
+  schedule:
+    # Jeden Montag 03:00 UTC (= 08:00 Uhr Omsk-Zeit, UTC+5)
+    # Holt waehrend des Fensters (1. Maerz - 7. Mai) neue Tage nach; ausserhalb
+    # des Fensters ueberspringt das Skript den Abruf automatisch (siehe
+    # scripts/fetch_short_term.py).
+    - cron: "0 3 * * 1"
+  workflow_dispatch: {}  # erlaubt manuellen Start über die GitHub-UI
+
+jobs:
+  fetch-spring-preseason-weather:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Frühjahrs-Vorsaison-Wetterdaten abrufen (1. März – 7. Mai, tagesgenau)
+        working-directory: scripts
+        run: python fetch_short_term.py
+
+      - name: Änderungen committen
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: spring pre-season weather data update"
+          file_pattern: "data/short_term/*.csv"

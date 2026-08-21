@@ -21,7 +21,7 @@ jobs:
       - name: Abhängigkeiten installieren
         run: pip install -r requirements.txt
 
-      - name: 10-Jahres-Klimadaten abrufen
+      - name: Agronomische Klimakennzahlen abrufen (10j + 30j, GDD/Frost/Trockenheit/Hitze)
         working-directory: scripts
         run: python fetch_long_term.py
 
