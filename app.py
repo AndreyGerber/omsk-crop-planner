@@ -121,6 +121,7 @@ REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 SHORT_TERM_CSV = os.path.join(REPO_ROOT, "data", "short_term", "weekly_weather.csv")
 LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_trend.csv")
 PER_YEAR_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_per_year_metrics.csv")
+MONTHLY_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_monthly_metrics.csv")
 CALIBRATION_CSV = os.path.join(REPO_ROOT, "data", "calibration", "actual_results.csv")
 
 REFERENCE_YEAR_FOR_DOY = 2001  # Nicht-Schaltjahr, nur zur Umrechnung MM-DD -> Tag-des-Jahres
@@ -192,6 +193,71 @@ def load_all_per_year(csv_path):
     for zone_id, group in df.groupby("zone_id"):
         result[zone_id] = group.to_dict("records")
     return result
+
+
+@st.cache_data(ttl=3600)
+def load_all_monthly(csv_path):
+    """
+    Lädt die Monats-Zeitreihe (März-Oktober, jedes Jahr). Gibt
+    {(zone_id, jahr): {monat: {niederschlag_mm, temperatur_mittel_c}}} zurück
+    — schneller Zugriff auf einen beliebigen Monat eines beliebigen Jahres.
+    """
+    if not os.path.isfile(csv_path):
+        return {}
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return {}
+    result = {}
+    for (zone_id, jahr), group in df.groupby(["zone_id", "jahr"]):
+        result[(zone_id, int(jahr))] = {
+            int(row["monat"]): {
+                "niederschlag_mm": row["niederschlag_mm"],
+                "temperatur_mittel_c": row["temperatur_mittel_c"],
+            }
+            for _, row in group.iterrows()
+        }
+    return result
+
+
+def characterize_harvest_wetness(zone_id, harvest_month, analog_years, monthly_data):
+    """
+    Vergleicht den Niederschlag im geschätzten Erntemonat der KONKRETEN
+    Kultur zwischen den Analog-Jahren und dem langjährigen Durchschnitt
+    für genau diesen Monat — ergibt eine Einschätzung "nass/trocken/normal"
+    speziell für das Erntefenster dieser Kultur, nicht pauschal für
+    August-September.
+    """
+    if not analog_years or harvest_month is None:
+        return None
+
+    analog_precip = []
+    for a in analog_years:
+        key = (zone_id, a["jahr"])
+        month_data = monthly_data.get(key, {}).get(harvest_month)
+        if month_data is not None:
+            analog_precip.append(month_data["niederschlag_mm"])
+    if not analog_precip:
+        return None
+    avg_analog = sum(analog_precip) / len(analog_precip)
+
+    baseline_precip = [
+        vals[harvest_month]["niederschlag_mm"]
+        for (zid, _), vals in monthly_data.items()
+        if zid == zone_id and harvest_month in vals
+    ]
+    if not baseline_precip:
+        return None
+    baseline_avg = sum(baseline_precip) / len(baseline_precip)
+
+    if avg_analog > baseline_avg * 1.3:
+        klass = "влажнее обычного"
+    elif avg_analog < baseline_avg * 0.7:
+        klass = "суше обычного"
+    else:
+        klass = "близко к норме"
+
+    month_name = RU_MONTHS_PREPOSITIONAL[harvest_month - 1]
+    return f"в {month_name} по похожим годам {klass} (~{round(avg_analog)} мм против ~{round(baseline_avg)} мм в среднем)"
 
 
 CALIBRATION_FIELDS = [
@@ -443,6 +509,7 @@ def build_zones():
 
 ZONES = build_zones()
 PER_YEAR_DATA = load_all_per_year(PER_YEAR_CSV)
+MONTHLY_DATA = load_all_monthly(MONTHLY_CSV)
 
 
 def render_zone_map(selected_zone_id):
@@ -612,6 +679,11 @@ RU_MONTHS_GENITIVE = [
     "июля", "августа", "сентября", "октября", "ноября", "декабря",
 ]
 
+RU_MONTHS_PREPOSITIONAL = [
+    "январе", "феврале", "марте", "апреле", "мае", "июне",
+    "июле", "августе", "сентябре", "октябре", "ноябре", "декабре",
+]
+
 # Ab wie vielen ausgewerteten Tagen (von insgesamt 68 im Fenster 1.3.-7.5.)
 # gilt der beobachtete Frost dieses Jahres als verlässlich genug, um die
 # 30-jährige Norm zu ersetzen, statt nur als vorläufige Teilbeobachtung.
@@ -675,20 +747,21 @@ def estimate_harvest_window(crop_name, zone):
     ersten Herbstfrost der Zone liegt -- dann Risikohinweis.
 
     WICHTIG: Dies ist eine reine Reifezeit-Schaetzung (Saatdatum + Mindesttage).
-    August-September-Wetter wird NICHT separat prognostiziert (dafuer fehlen
-    aktuell eigene Daten) -- fuer die tatsaechliche Befahrbarkeit des Feldes ist
-    zusaetzlich der Draenage-Hinweis unten zu beachten.
+    Der Monat der geschaetzten Ernte (harvest_month) wird zusaetzlich
+    zurueckgegeben, damit characterize_harvest_wetness() gezielt fuer GENAU
+    diesen Monat nachschauen kann, wie nass/trocken vergleichbare
+    historische Jahre dort waren -- statt eines pauschalen Draenage-Hinweises.
     """
     crop = CROPS.get(crop_name)
     profile = SOWING_PROFILE.get(crop_name)
     if crop is None or profile is None:
-        return {"дата": "нет данных", "риск": False, "риск_текст": ""}
+        return {"дата": "нет данных", "риск": False, "риск_текст": "", "harvest_month": None}
     if profile["тип_посева"] == "озимый":
-        return {"дата": "лето следующего года (июль)", "риск": False, "риск_текст": ""}
+        return {"дата": "лето следующего года (июль)", "риск": False, "риск_текст": "", "harvest_month": 7}
 
     sowing_doy, _ = _estimate_sowing_doy(crop_name, zone)
     if sowing_doy is None:
-        return {"дата": "нет данных о заморозках", "риск": False, "риск_текст": ""}
+        return {"дата": "нет данных о заморозках", "риск": False, "риск_текст": "", "harvest_month": None}
 
     harvest_doy = sowing_doy + crop["мин_дни_роста"]
     harvest_date = date(REFERENCE_YEAR_FOR_DOY, 1, 1) + timedelta(days=harvest_doy - 1)
@@ -706,7 +779,7 @@ def estimate_harvest_window(crop_name, zone):
             risk = True
             risk_text = f"⚠️ близко к обычному заморозку (запас {zapas_dney} дн.)"
 
-    return {"дата": date_str, "риск": risk, "риск_текст": risk_text}
+    return {"дата": date_str, "риск": risk, "риск_текст": risk_text, "harvest_month": harvest_date.month}
 
 
 SOIL_TYPES_INFO = {
@@ -1372,6 +1445,9 @@ if st.button("🚀 Начать моделирование", type="primary", dis
         s = score_crop(crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights)
         harvest = estimate_harvest_window(crop_name, zone)
         harvest_display = harvest["дата"] + (f" {harvest['риск_текст']}" if harvest["риск"] else "")
+        wetness = characterize_harvest_wetness(zone_id, harvest.get("harvest_month"), analog_years, MONTHLY_DATA)
+        if wetness:
+            harvest_display += f" · {wetness}"
         results.append({
             "Культура": crop_name,
             "Балл пригодности": s,
