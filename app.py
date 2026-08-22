@@ -56,6 +56,68 @@ def render_wrapped_table(df, col_widths_pct=None):
     )
     st.markdown(html, unsafe_allow_html=True)
 
+
+def render_grouped_weekly_table(row_label, row_keys, row_display, metric_groups):
+    """
+    Rendert eine Tabelle mit ZWEISTUFIGEM Kopf: pro Metrik (z.B. "Осадки (мм)")
+    eine Gruppenspalte, darunter je eine Unterspalte pro Jahr — damit man
+    Werte über mehrere Jahre für dieselbe Woche direkt nebeneinander sieht,
+    statt in langem Format untereinander (ein Jahr nach dem anderen).
+
+    row_label: Beschriftung der ersten Spalte (z.B. "Неделя")
+    row_keys: Liste der Zeilen-Schlüssel (z.B. ISO-Wochennummern), chronologisch
+    row_display: dict {row_key: Anzeigetext für die erste Spalte}
+    metric_groups: dict {Metrikname: {jahr: {row_key: wert}}}
+    """
+    jahre_pro_metrik = {
+        metrik: sorted(jahre_dict.keys()) for metrik, jahre_dict in metric_groups.items()
+    }
+    gesamt_unterspalten = sum(len(js) for js in jahre_pro_metrik.values())
+    row_label_width = 12
+    rest_width = 100 - row_label_width
+    sub_width = rest_width / gesamt_unterspalten if gesamt_unterspalten else rest_width
+
+    colgroup = f'<col style="width:{row_label_width}%">'
+    colgroup += "".join(
+        f'<col style="width:{sub_width}%">'
+        for metrik in metric_groups for _ in jahre_pro_metrik[metrik]
+    )
+
+    header_row1 = f'<th rowspan="2" style="text-align:left;padding:6px 8px;border-bottom:2px solid #999;border-right:1px solid #ccc;font-weight:600;vertical-align:bottom;">{row_label}</th>'
+    for metrik in metric_groups:
+        n_sub = len(jahre_pro_metrik[metrik])
+        header_row1 += (
+            f'<th colspan="{n_sub}" style="text-align:center;padding:6px 8px;'
+            f'border-bottom:1px solid #ccc;border-right:2px solid #999;font-weight:600;">{metrik}</th>'
+        )
+
+    header_row2 = ""
+    for metrik in metric_groups:
+        for jahr in jahre_pro_metrik[metrik]:
+            header_row2 += (
+                f'<th style="text-align:center;padding:4px 6px;border-bottom:2px solid #999;'
+                f'font-weight:500;color:#555;">{jahr}</th>'
+            )
+
+    body_rows = ""
+    for rk in row_keys:
+        cells = f'<td style="padding:6px 8px;border-bottom:1px solid #e0e0e0;border-right:1px solid #ccc;white-space:nowrap;">{row_display.get(rk, rk)}</td>'
+        for metrik in metric_groups:
+            for jahr in jahre_pro_metrik[metrik]:
+                val = metric_groups[metrik][jahr].get(rk, "")
+                cells += f'<td style="text-align:center;padding:6px 8px;border-bottom:1px solid #e0e0e0;">{val}</td>'
+        body_rows += f"<tr>{cells}</tr>"
+
+    html = (
+        '<div style="width:100%;overflow-x:hidden;">'
+        '<table style="width:100%;table-layout:fixed;border-collapse:collapse;font-size:0.85rem;">'
+        f'<colgroup>{colgroup}</colgroup>'
+        f'<thead><tr>{header_row1}</tr><tr>{header_row2}</tr></thead>'
+        f'<tbody>{body_rows}</tbody>'
+        '</table></div>'
+    )
+    st.markdown(html, unsafe_allow_html=True)
+
 # ---------------------------------------------------------------------------
 # СПРАВОЧНЫЕ ДАННЫЕ (заглушки — в реальной версии заменяются на API/базу данных)
 # ---------------------------------------------------------------------------
@@ -1106,6 +1168,13 @@ analog_years = find_analog_years(
 )
 if analog_years:
     st.subheader("🔮 Похожие по погоде годы")
+    st.caption(
+        "Как это работает: берутся данные ЭТОГО года с 1 марта по 7 мая "
+        "(даты заморозков + сумма осадков) — от начала до конца этого периода. "
+        "Затем среди всех лет 1996–2025 ищутся 3 года, у которых этот же "
+        "период (1 марта – 7 мая) прошёл максимально похоже. Ниже — именно "
+        "эти 3 года, у которых начало сезона выглядело так же, как в этом году."
+    )
     narrative = build_analog_narrative(zone, analog_years)
     if narrative:
         st.write(narrative)
@@ -1155,10 +1224,31 @@ if analog_years:
             precip_pivot = weekly_df.pivot_table(index="iso_нед", columns="Год", values="Осадки (мм)")
             st.bar_chart(precip_pivot)
 
-            st.caption("Точные значения по неделям:")
-            render_wrapped_table(
-                weekly_df.drop(columns=["iso_нед"]),
-                col_widths_pct=[10, 35, 27, 28],
+            st.caption("Точные значения по неделям (каждый год — отдельная подколонка):")
+
+            # Woche -> Zeitraum-Label (nimmt das erste verfügbare Jahr als Referenz für die Anzeige)
+            row_display = {}
+            for _, r in weekly_df.sort_values("iso_нед").iterrows():
+                if r["iso_нед"] not in row_display:
+                    row_display[r["iso_нед"]] = f"КВ {r['iso_нед']} ({r['Период']})"
+            row_keys = sorted(row_display.keys())
+
+            osadki_by_year = {}
+            temp_by_year = {}
+            for a in analog_years:
+                jahr_str = str(a["jahr"])
+                sub = weekly_df[weekly_df["Год"] == jahr_str]
+                osadki_by_year[jahr_str] = dict(zip(sub["iso_нед"], sub["Осадки (мм)"]))
+                temp_by_year[jahr_str] = dict(zip(sub["iso_нед"], sub["Температура (°C)"]))
+
+            render_grouped_weekly_table(
+                row_label="Неделя",
+                row_keys=row_keys,
+                row_display=row_display,
+                metric_groups={
+                    "Осадки (мм)": osadki_by_year,
+                    "Температура (°C)": temp_by_year,
+                },
             )
         else:
             st.caption("Понедельные данные для похожих лет не найдены.")
