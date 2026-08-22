@@ -122,6 +122,7 @@ SHORT_TERM_CSV = os.path.join(REPO_ROOT, "data", "short_term", "weekly_weather.c
 LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_trend.csv")
 PER_YEAR_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_per_year_metrics.csv")
 MONTHLY_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_monthly_metrics.csv")
+WEEKLY_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_weekly_metrics.csv")
 CALIBRATION_CSV = os.path.join(REPO_ROOT, "data", "calibration", "actual_results.csv")
 
 REFERENCE_YEAR_FOR_DOY = 2001  # Nicht-Schaltjahr, nur zur Umrechnung MM-DD -> Tag-des-Jahres
@@ -219,27 +220,56 @@ def load_all_monthly(csv_path):
     return result
 
 
+@st.cache_data(ttl=3600)
+def load_all_weekly(csv_path):
+    """
+    Lädt die Wochen-Zeitreihe (ISO-Kalenderwochen, März-Oktober, jedes Jahr).
+    Gibt {(zone_id, jahr): [Wochen-Zeilen als dict, chronologisch sortiert]} zurück
+    — feinere Auflösung als die Monatsdaten, zeigt Schwankungen INNERHALB
+    eines Monats statt sie zu einem einzigen Mittelwert zu verdichten.
+    """
+    if not os.path.isfile(csv_path):
+        return {}
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        return {}
+    result = {}
+    for (zone_id, jahr), group in df.groupby(["zone_id", "jahr"]):
+        result[(zone_id, int(jahr))] = group.sort_values("iso_woche").to_dict("records")
+    return result
+
+
 def characterize_harvest_wetness(zone_id, harvest_month, analog_years, monthly_data):
     """
     Vergleicht den Niederschlag im geschätzten Erntemonat der KONKRETEN
-    Kultur zwischen den Analog-Jahren und dem langjährigen Durchschnitt
-    für genau diesen Monat — ergibt eine Einschätzung "nass/trocken/normal"
-    speziell für das Erntefenster dieser Kultur, nicht pauschal für
-    August-September.
+    Kultur zwischen den Analog-Jahren und dem 30-jährigen Durchschnitt
+    (1996–2025) für genau diesen Monat.
+
+    Zeigt die EINZELNEN Werte pro Analog-Jahr (nicht nur einen gemittelten
+    Wert) — ein Durchschnitt kann große Schwankungen zwischen den Jahren
+    verschlucken (z.B. ein sehr nasses + ein sehr trockenes Jahr ergeben
+    zusammen einen unauffälligen Mittelwert). Tagesgenaue Wetterschätzung
+    ist damit natürlich nicht möglich — dafür bräuchte es eine echte
+    Wettervorhersage näher am Termin.
+
+    Gibt ein Dict zurück (nicht einen fertigen Satz), damit der Aufrufer
+    Datum und Feuchte-Einschätzung in GETRENNTEN Tabellenspalten anzeigen
+    kann statt in einer überladenen Zelle.
     """
     if not analog_years or harvest_month is None:
         return None
 
-    analog_precip = []
+    per_year = []
     for a in analog_years:
         key = (zone_id, a["jahr"])
         month_data = monthly_data.get(key, {}).get(harvest_month)
         if month_data is not None:
-            analog_precip.append(month_data["niederschlag_mm"])
-    if not analog_precip:
+            per_year.append({"jahr": a["jahr"], "мм": round(month_data["niederschlag_mm"])})
+    if not per_year:
         return None
-    avg_analog = sum(analog_precip) / len(analog_precip)
+    avg_analog = sum(y["мм"] for y in per_year) / len(per_year)
 
+    baseline_years = [year for (zid, year) in monthly_data.keys() if zid == zone_id]
     baseline_precip = [
         vals[harvest_month]["niederschlag_mm"]
         for (zid, _), vals in monthly_data.items()
@@ -248,16 +278,33 @@ def characterize_harvest_wetness(zone_id, harvest_month, analog_years, monthly_d
     if not baseline_precip:
         return None
     baseline_avg = sum(baseline_precip) / len(baseline_precip)
+    baseline_von = min(baseline_years) if baseline_years else None
+    baseline_bis = max(baseline_years) if baseline_years else None
 
     if avg_analog > baseline_avg * 1.3:
-        klass = "влажнее обычного"
+        klass = "влажнее нормы"
     elif avg_analog < baseline_avg * 0.7:
-        klass = "суше обычного"
+        klass = "суше нормы"
     else:
         klass = "близко к норме"
 
     month_name = RU_MONTHS_PREPOSITIONAL[harvest_month - 1]
-    return f"в {month_name} по похожим годам {klass} (~{round(avg_analog)} мм против ~{round(baseline_avg)} мм в среднем)"
+    norma_period = f"{baseline_von}–{baseline_bis} гг." if baseline_von else "многолетний период"
+
+    po_godam_text = ", ".join(f"{y['jahr']} — {y['мм']} мм" for y in per_year)
+
+    return {
+        "класс": klass,
+        "месяц": month_name,
+        "по_годам": per_year,
+        "похожие_года_мм": round(avg_analog),
+        "норма_мм": round(baseline_avg),
+        "норма_период": norma_period,
+        "краткий_текст": (
+            f"{klass} в {month_name} — по годам: {po_godam_text} "
+            f"(норма {norma_period}: {round(baseline_avg)} мм)"
+        ),
+    }
 
 
 CALIBRATION_FIELDS = [
@@ -335,6 +382,7 @@ def find_analog_years(zone_id, current_frost_doy, current_niederschlag, per_year
             "saison_hitzetage": r.get("saison_hitzetage"),
             "saison_trockenperiode": r.get("saison_laengste_trockenperiode_tage"),
             "saison_temperatur": r.get("saison_temperatur_mittel_c"),
+            "saison_niederschlag": r.get("saison_niederschlag_mm"),
             "herbstfrost_doy": r.get("erster_herbstfrost_doy"),
         })
 
@@ -510,6 +558,7 @@ def build_zones():
 ZONES = build_zones()
 PER_YEAR_DATA = load_all_per_year(PER_YEAR_CSV)
 MONTHLY_DATA = load_all_monthly(MONTHLY_CSV)
+WEEKLY_DATA = load_all_weekly(WEEKLY_CSV)
 
 
 def render_zone_map(selected_zone_id):
@@ -1060,15 +1109,45 @@ if analog_years:
     narrative = build_analog_narrative(zone, analog_years)
     if narrative:
         st.write(narrative)
-    show_analog_details = st.checkbox("Показать детали по похожим годам", key=f"analog_details_{zone_id}")
+
+    show_analog_details = st.checkbox("Показать погодные данные похожих лет", key=f"analog_details_{zone_id}")
     if show_analog_details:
+        st.write("**Сводные показатели по каждому похожему году** (эти же параметры учитываются в расчёте балла пригодности):")
+        summary_rows = []
         for a in analog_years:
-            st.write(
-                f"· **{a['jahr']}** (заморозок {a['vorsaison_frost']}, "
-                f"{a['vorsaison_niederschlag']} мм осадков) "
-                f"→ сезон: GDD {a['saison_gdd']}, жарких дней {a['saison_hitzetage']}, "
-                f"засуха до {a['saison_trockenperiode']} дн."
-            )
+            herbstfrost_doy = a.get("herbstfrost_doy")
+            herbstfrost_readable = _doy_to_readable(herbstfrost_doy) if herbstfrost_doy is not None and not pd.isna(herbstfrost_doy) else "нет данных"
+            summary_rows.append({
+                "Год": a["jahr"],
+                "Заморозок весной (до 7 мая)": a["vorsaison_frost"],
+                "Осадки до 7 мая": f"{a['vorsaison_niederschlag']} мм",
+                "Ср. темп. сезона (май-сент.)": f"{a['saison_temperatur']} °C" if a.get("saison_temperatur") is not None else "—",
+                "Осадки сезона (май-сент.)": f"{a['saison_niederschlag']} мм" if a.get("saison_niederschlag") is not None else "—",
+                "Тепловая сумма GDD": a["saison_gdd"],
+                "Жарких дней (>30°C)": a["saison_hitzetage"],
+                "Засуха (дней подряд)": a["saison_trockenperiode"],
+                "Первый осенний заморозок": herbstfrost_readable,
+            })
+        summary_df = pd.DataFrame(summary_rows)
+        render_wrapped_table(summary_df, col_widths_pct=[7, 14, 11, 13, 13, 12, 12, 10, 8])
+
+        st.write("**Погода по неделям в похожих годах** (март–октябрь):")
+        weekly_rows = []
+        for a in analog_years:
+            key = (zone_id, a["jahr"])
+            weeks_data = WEEKLY_DATA.get(key, [])
+            for w in weeks_data:
+                weekly_rows.append({
+                    "Год": a["jahr"],
+                    "Период": f"{w['von']} – {w['bis']}",
+                    "Осадки (мм)": w["niederschlag_mm"],
+                    "Температура (°C)": w["temperatur_mittel_c"],
+                })
+        if weekly_rows:
+            weekly_df = pd.DataFrame(weekly_rows)
+            render_wrapped_table(weekly_df, col_widths_pct=[10, 35, 27, 28])
+        else:
+            st.caption("Понедельные данные для похожих лет не найдены.")
 elif "_kurzfristig_zeitraum" in zone:
     st.info(
         "ℹ️ Похожих лет не найдено — недостаточно исторических данных для сравнения "
@@ -1445,9 +1524,6 @@ if st.button("🚀 Начать моделирование", type="primary", dis
         s = score_crop(crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights)
         harvest = estimate_harvest_window(crop_name, zone)
         harvest_display = harvest["дата"] + (f" {harvest['риск_текст']}" if harvest["риск"] else "")
-        wetness = characterize_harvest_wetness(zone_id, harvest.get("harvest_month"), analog_years, MONTHLY_DATA)
-        if wetness:
-            harvest_display += f" · {wetness}"
         results.append({
             "Культура": crop_name,
             "Балл пригодности": s,
@@ -1480,7 +1556,8 @@ if st.button("🚀 Начать моделирование", type="primary", dis
         "Балл пригодности рассчитан на основе соответствия почвы, pH, вегетационного окна "
         "(по реальным датам заморозков), тепловой суммы (GDD), водообеспеченности с учётом "
         "риска засухи, жаростойкости и урожайного потенциала. Это прототип — веса и "
-        "справочные значения культур подлежат уточнению."
+        "справочные значения культур подлежат уточнению. Данные по погоде похожих лет — "
+        "см. раздел «🔮 Похожие по погоде годы» выше."
     )
 
     drainage_hinweise = {

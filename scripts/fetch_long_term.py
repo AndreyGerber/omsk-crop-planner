@@ -138,6 +138,34 @@ def _compute_monthly_breakdown(year_records):
     return result
 
 
+def _compute_weekly_breakdown(year_records):
+    """
+    Wöchentliche (statt nur monatliche) Niederschlags-/Temperaturaufschlüsselung
+    für EIN Jahr, März-Oktober. Ein Monatsmittel kann innerhalb eines Monats
+    noch erhebliche Schwankungen verschlucken (z.B. 3 nasse + 1 trockene
+    Woche ergeben denselben Monatsmittelwert wie 4 gleichmäßig mittlere
+    Wochen) — die Wochenauflösung zeigt diese Struktur.
+
+    Nutzt die ISO-Kalenderwoche (Montag-Sonntag) als Gruppierung.
+    """
+    by_week = defaultdict(list)
+    for r in year_records:
+        if 3 <= r["date"].month <= 10:  # dieselbe Grenze wie bei der Monatsaufschlüsselung
+            iso_year, iso_week, _ = r["date"].isocalendar()
+            by_week[(iso_year, iso_week)].append(r)
+
+    result = {}
+    for (iso_year, iso_week), recs in by_week.items():
+        recs_sorted = sorted(recs, key=lambda r: r["date"])
+        result[(iso_year, iso_week)] = {
+            "von": recs_sorted[0]["date"],
+            "bis": recs_sorted[-1]["date"],
+            "niederschlag_mm": round(sum(r["precip"] for r in recs), 1),
+            "temperatur_mittel_c": round(sum(r["mean"] for r in recs) / len(recs), 1),
+        }
+    return result
+
+
 def _compute_year_metrics(year_records, year):
     """Berechnet alle Kennzahlen für EIN Kalenderjahr aus dessen Tagesdaten."""
     year_records = sorted(year_records, key=lambda r: r["date"])
@@ -168,6 +196,7 @@ def _compute_year_metrics(year_records, year):
 
     vorsaison = _compute_vorsaison_metrics(year_records, year)
     monthly = _compute_monthly_breakdown(year_records)
+    weekly = _compute_weekly_breakdown(year_records)
 
     return {
         "gdd": gdd,
@@ -181,6 +210,7 @@ def _compute_year_metrics(year_records, year):
         "vorsaison_letzter_frost": vorsaison["letzter_frost"],
         "vorsaison_niederschlag_mm": vorsaison["niederschlag_mm"],
         "monthly": monthly,
+        "weekly": weekly,
     }
 
 
@@ -404,11 +434,52 @@ def _write_monthly_rows(monthly_file, zone_id, zone_name, per_year_metrics, exis
     return len(new_rows)
 
 
+def _write_weekly_rows(weekly_file, zone_id, zone_name, per_year_metrics, existing_keys):
+    """
+    Hängt neue wöchentliche Zeilen an — Long-Format (eine Zeile pro
+    ISO-Kalenderwoche und Jahr), für feinere zeitliche Auflösung als die
+    Monatsaufschlüsselung.
+    """
+    file_exists = os.path.isfile(weekly_file)
+    fieldnames = ["zone_id", "zone_name", "jahr", "iso_woche", "von", "bis", "niederschlag_mm", "temperatur_mittel_c"]
+
+    new_rows = []
+    for year, m in sorted(per_year_metrics.items()):
+        if m is None or "weekly" not in m:
+            continue
+        key = (zone_id, str(year))
+        if key in existing_keys:
+            continue
+        for (iso_year, iso_week), vals in sorted(m["weekly"].items()):
+            new_rows.append({
+                "zone_id": zone_id,
+                "zone_name": zone_name,
+                "jahr": year,
+                "iso_woche": iso_week,
+                "von": vals["von"].isoformat(),
+                "bis": vals["bis"].isoformat(),
+                "niederschlag_mm": vals["niederschlag_mm"],
+                "temperatur_mittel_c": vals["temperatur_mittel_c"],
+            })
+
+    if not new_rows:
+        return 0
+
+    with open(weekly_file, "a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerows(new_rows)
+
+    return len(new_rows)
+
+
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     out_file = os.path.join(OUTPUT_DIR, "yearly_climate_trend.csv")
     per_year_file = os.path.join(OUTPUT_DIR, "yearly_per_year_metrics.csv")
     monthly_file = os.path.join(OUTPUT_DIR, "yearly_monthly_metrics.csv")
+    weekly_file = os.path.join(OUTPUT_DIR, "yearly_weekly_metrics.csv")
     file_exists = os.path.isfile(out_file)
 
     end_year = date.today().year - 1
@@ -427,6 +498,7 @@ def main():
 
     total_per_year_written = 0
     total_monthly_written = 0
+    total_weekly_written = 0
     for i, (zone_id, zone) in enumerate(zones_to_fetch):
         print(f"Hole {YEARS_LONG}-Jahres-Rohdaten für Zone: {zone_id} (März-Oktober, daraus alle Kennzahlen berechnet)")
         agg_row, per_year_metrics = fetch_zone_climate(zone_id, zone)
@@ -439,6 +511,10 @@ def main():
         n_monthly = _write_monthly_rows(monthly_file, zone_id, zone["name_ru"], per_year_metrics, existing_per_year_keys)
         total_monthly_written += n_monthly
         print(f"  {n_monthly} neue Monats-Zeilen für {zone_id} gespeichert.")
+
+        n_weekly = _write_weekly_rows(weekly_file, zone_id, zone["name_ru"], per_year_metrics, existing_per_year_keys)
+        total_weekly_written += n_weekly
+        print(f"  {n_weekly} neue Wochen-Zeilen für {zone_id} gespeichert.")
 
         if i < len(zones_to_fetch) - 1:
             time.sleep(5)  # kurze Pause zwischen Zonen, zusätzlich zur Pause zwischen Chunks
@@ -456,6 +532,7 @@ def main():
     print(f"{len(rows)} Aggregat-Zeilen an {out_file} angehängt.")
     print(f"{total_per_year_written} Einzeljahres-Zeilen insgesamt an {per_year_file} angehängt.")
     print(f"{total_monthly_written} Monats-Zeilen insgesamt an {monthly_file} angehängt.")
+    print(f"{total_weekly_written} Wochen-Zeilen insgesamt an {weekly_file} angehängt.")
 
 
 if __name__ == "__main__":
