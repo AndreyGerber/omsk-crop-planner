@@ -1110,8 +1110,7 @@ if analog_years:
     if narrative:
         st.write(narrative)
 
-    show_analog_details = st.checkbox("Показать погодные данные похожих лет", key=f"analog_details_{zone_id}")
-    if show_analog_details:
+    with st.expander("📊 Показать погодные данные похожих лет"):
         st.write("**Сводные показатели по каждому похожему году** (эти же параметры учитываются в расчёте балла пригодности):")
         summary_rows = []
         for a in analog_years:
@@ -1138,14 +1137,29 @@ if analog_years:
             weeks_data = WEEKLY_DATA.get(key, [])
             for w in weeks_data:
                 weekly_rows.append({
-                    "Год": a["jahr"],
+                    "Год": str(a["jahr"]),
+                    "iso_нед": w["iso_woche"],
                     "Период": f"{w['von']} – {w['bis']}",
                     "Осадки (мм)": w["niederschlag_mm"],
                     "Температура (°C)": w["temperatur_mittel_c"],
                 })
+
         if weekly_rows:
             weekly_df = pd.DataFrame(weekly_rows)
-            render_wrapped_table(weekly_df, col_widths_pct=[10, 35, 27, 28])
+
+            st.caption("Температура по неделям (для сравнения похожих лет):")
+            temp_pivot = weekly_df.pivot_table(index="iso_нед", columns="Год", values="Температура (°C)")
+            st.line_chart(temp_pivot)
+
+            st.caption("Осадки по неделям (для сравнения похожих лет):")
+            precip_pivot = weekly_df.pivot_table(index="iso_нед", columns="Год", values="Осадки (мм)")
+            st.bar_chart(precip_pivot)
+
+            st.caption("Точные значения по неделям:")
+            render_wrapped_table(
+                weekly_df.drop(columns=["iso_нед"]),
+                col_widths_pct=[10, 35, 27, 28],
+            )
         else:
             st.caption("Понедельные данные для похожих лет не найдены.")
 elif "_kurzfristig_zeitraum" in zone:
