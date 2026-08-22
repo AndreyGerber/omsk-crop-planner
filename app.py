@@ -187,6 +187,7 @@ LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_tre
 PER_YEAR_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_per_year_metrics.csv")
 MONTHLY_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_monthly_metrics.csv")
 WEEKLY_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_weekly_metrics.csv")
+ECONOMICS_CSV = os.path.join(REPO_ROOT, "data", "economics", "world_crop_stats.csv")
 CALIBRATION_CSV = os.path.join(REPO_ROOT, "data", "calibration", "actual_results.csv")
 
 REFERENCE_YEAR_FOR_DOY = 2001  # Nicht-Schaltjahr, nur zur Umrechnung MM-DD -> Tag-des-Jahres
@@ -309,6 +310,15 @@ def load_daily_spring(csv_path):
     if not os.path.isfile(csv_path):
         return pd.DataFrame()
     return pd.read_csv(csv_path)
+
+
+@st.cache_data(ttl=3600)
+def load_economics(csv_path):
+    """Laedt die weltweite/russische Anbau-/Erntestatistik (FAOSTAT) -- reine Historie."""
+    if not os.path.isfile(csv_path):
+        return pd.DataFrame()
+    return pd.read_csv(csv_path)
+
 
 
 def weekly_series_by_position(zone_id, jahr, weekly_data):
@@ -673,6 +683,7 @@ PER_YEAR_DATA = load_all_per_year(PER_YEAR_CSV)
 MONTHLY_DATA = load_all_monthly(MONTHLY_CSV)
 WEEKLY_DATA = load_all_weekly(WEEKLY_CSV)
 DAILY_SPRING_DF = load_daily_spring(DAILY_SPRING_CSV)
+ECONOMICS_DF = load_economics(ECONOMICS_CSV)
 
 
 def render_zone_map(selected_zone_id):
@@ -1925,6 +1936,77 @@ if not calibration_df.empty:
     if active_overrides:
         st.write("**Активные калибровки** (используются вместо справочных значений при моделировании):")
         render_wrapped_table(pd.DataFrame(active_overrides), col_widths_pct=[22, 22, 20, 20, 16])
+
+st.header("6. Мировая и российская статистика посевов (справочно)")
+st.caption(
+    "⚠️ Это ИСТОРИЯ, не прогноз цен. Сколько площади в мире и в России отводилось "
+    "под каждую культуру в последние годы, и растёт или падает эта площадь. "
+    "Цены зависят от спроса, политики и валютных курсов — это модель принципиально "
+    "не пытается предсказывать. Источник: FAOSTAT (ООН)."
+)
+
+if ECONOMICS_DF.empty:
+    st.info(
+        "ℹ️ Данных пока нет. Запустите workflow «World crop economics fetch» в "
+        "GitHub Actions и сделайте `git pull`."
+    )
+else:
+    max_year = int(ECONOMICS_DF["year"].max())
+    st.caption(
+        f"📅 Самый свежий доступный год в данных FAOSTAT: **{max_year}**. "
+        f"Более новых данных пока нет — международная статистика публикуется "
+        f"с задержкой в 1-2 года."
+    )
+
+    econ_crop = st.selectbox(
+        "Культура для статистики",
+        sorted(ECONOMICS_DF["crop_name_ru"].unique()),
+        key="econ_crop_select",
+    )
+
+    crop_econ_df = ECONOMICS_DF[ECONOMICS_DF["crop_name_ru"] == econ_crop]
+
+    econ_cols = st.columns(2)
+    with econ_cols[0]:
+        st.caption(f"**Площадь посева, га — {econ_crop}**")
+        area_df = crop_econ_df[crop_econ_df["element"] == "area_harvested_ha"]
+        area_pivot = area_df.pivot_table(index="year", columns="area_scope", values="value")
+        area_pivot = area_pivot.rename(columns={"world": "Мир", "russia": "Россия"})
+        st.line_chart(area_pivot)
+    with econ_cols[1]:
+        st.caption(f"**Производство, тонн — {econ_crop}**")
+        prod_df = crop_econ_df[crop_econ_df["element"] == "production_t"]
+        prod_pivot = prod_df.pivot_table(index="year", columns="area_scope", values="value")
+        prod_pivot = prod_pivot.rename(columns={"world": "Мир", "russia": "Россия"})
+        st.line_chart(prod_pivot)
+
+    # Tendenz: letztes verfuegbares Jahr vs. Mittel der 5 Jahre davor
+    latest_area_world = area_df[(area_df["area_scope"] == "world") & (area_df["year"] == max_year)]["value"]
+    prev_area_world = area_df[(area_df["area_scope"] == "world") & (area_df["year"] < max_year) & (area_df["year"] >= max_year - 5)]["value"]
+    if not latest_area_world.empty and not prev_area_world.empty:
+        latest_val = latest_area_world.iloc[0]
+        prev_avg = prev_area_world.mean()
+        delta_pct = (latest_val - prev_avg) / prev_avg * 100
+        if delta_pct > 3:
+            trend_text = f"выросла на {round(delta_pct, 1)}% по сравнению со средней за предыдущие 5 лет"
+        elif delta_pct < -3:
+            trend_text = f"снизилась на {round(abs(delta_pct), 1)}% по сравнению со средней за предыдущие 5 лет"
+        else:
+            trend_text = "осталась примерно на уровне последних 5 лет"
+        st.write(
+            f"**Тенденция ({max_year} год):** мировая площадь посева культуры «{econ_crop}» {trend_text}."
+        )
+
+    with st.expander("Показать таблицу по годам"):
+        table_rows = []
+        for _, r in crop_econ_df.sort_values(["year", "area_scope", "element"]).iterrows():
+            table_rows.append({
+                "Год": int(r["year"]),
+                "Регион": "Мир" if r["area_scope"] == "world" else "Россия",
+                "Показатель": "Площадь, га" if r["element"] == "area_harvested_ha" else "Производство, т",
+                "Значение": round(r["value"]),
+            })
+        render_wrapped_table(pd.DataFrame(table_rows), col_widths_pct=[15, 20, 30, 35])
 
 st.divider()
 

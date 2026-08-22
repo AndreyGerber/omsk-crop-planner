@@ -1,0 +1,32 @@
+name: World crop economics fetch
+
+on:
+  schedule:
+    # Einmal im Monat (FAOSTAT-Daten aendern sich selten, taeglich waere unnoetig)
+    - cron: "0 4 1 * *"
+  workflow_dispatch: {}  # erlaubt manuellen Start über die GitHub-UI
+
+jobs:
+  fetch-world-crop-stats:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Repo auschecken
+        uses: actions/checkout@v4
+
+      - name: Python einrichten
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: pip install -r requirements.txt
+
+      - name: Welt-/Russland-Anbaustatistik abrufen (FAOSTAT)
+        working-directory: scripts
+        run: python fetch_world_crop_stats.py
+
+      - name: Änderungen committen
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: world/russia crop economics update"
+          file_pattern: "data/economics/*.csv"
