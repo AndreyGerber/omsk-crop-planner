@@ -1172,12 +1172,46 @@ def predecessor_effect_score(prev_effect, candidate_effect):
 
 
 def get_predecessor_effect(history):
-    """Ermittelt эффект_азот der zuletzt (jüngstes Jahr) angebauten Kultur, oder None."""
+    """Ermittelt эффект_азот der zuletzt (juengstes Jahr) angebauten Kultur, oder None."""
     if not history:
         return None
     letztes_jahr = max(history.keys())
     letzte_kultur = history[letztes_jahr]
     return CROPS.get(letzte_kultur, {}).get("эффект_азот")
+
+
+def explain_predecessor_relationship(crop_name, crop_azot_effect, history):
+    """
+    Erklaert IMMER (nicht nur wenn es zufaellig unter die Top-3-Faktoren faellt)
+    die Beziehung zwischen der letzten Kultur auf dem Feld und dem aktuellen
+    Kandidaten -- genau die Frage "beeinflussen sich Kulturen gegenseitig
+    negativ/positiv".
+    """
+    if not history:
+        return (
+            f"Влияние предшественника для **{crop_name}**: история посевов пуста, "
+            f"поэтому этот фактор оценён нейтрально (0.7 из 1.0)."
+        )
+
+    letztes_jahr = max(history.keys())
+    letzte_kultur = history[letztes_jahr]
+    letzter_effekt = CROPS.get(letzte_kultur, {}).get("эффект_азот")
+    score = predecessor_effect_score(letzter_effekt, crop_azot_effect)
+
+    if score >= 0.95:
+        charakter = "отличное сочетание — азот, оставшийся после предшественника, пойдёт на пользу"
+    elif score >= 0.75:
+        charakter = "хорошее сочетание"
+    elif score >= 0.55:
+        charakter = "нейтральное сочетание — заметного влияния друг на друга нет"
+    else:
+        charakter = "неудачное сочетание — обе культуры истощают почву без восстановления азота между ними"
+
+    return (
+        f"Влияние предшественника для **{crop_name}**: в {letztes_jahr} году на поле "
+        f"росла **{letzte_kultur}** ({letzter_effekt} эффект на азот), у {crop_name} — "
+        f"{crop_azot_effect} эффект. Это {charakter}."
+    )
 
 
 def explain_best_crop(crop_name, sub_scores, weights, top_n=3):
@@ -1269,6 +1303,44 @@ def explain_rotation_exclusion(crop_name, crop_data, history, reason=None):
     )
 
 
+
+
+def build_blocked_table(blocked_df, history):
+    """
+    Baut eine ZWECKMAESSIGE Tabelle fuer ausgeschlossene Kulturen -- zeigt
+    Grund, geforderten Rotationsabstand und wann zuletzt gesaet wurde, statt
+    einfach dieselben (hier irrelevanten) Anbau-Eigenschaften wie in der
+    Haupttabelle zu wiederholen.
+    """
+    rows = []
+    for _, row in blocked_df.iterrows():
+        crop_name = row["Культура"]
+        reason = row.get("Причина_блокировки", "")
+        gap = CROPS[crop_name]["интервал_севооборота_лет"]
+
+        if reason == "истощение":
+            letztes_jahr = max(history.keys())
+            letzte_kultur = history[letztes_jahr]
+            causa_text = f"Истощение почвы (после {letzte_kultur})"
+            posev_text = f"{letztes_jahr} — {letzte_kultur}"
+            gap_text = "—"
+            svoboden_text = "—"
+        else:
+            letzte_jahre = [year for year, planted in history.items() if planted == crop_name]
+            letztes_jahr = max(letzte_jahre) if letzte_jahre else None
+            causa_text = "Повтор культуры"
+            posev_text = f"{letztes_jahr} год" if letztes_jahr else "—"
+            gap_text = f"{gap} г."
+            svoboden_text = f"{letztes_jahr + gap} год" if letztes_jahr else "—"
+
+        rows.append({
+            "Культура": crop_name,
+            "Причина исключения": causa_text,
+            "Когда сеялась/росла": posev_text,
+            "Треб. интервал": gap_text,
+            "Свободна с": svoboden_text,
+        })
+    return pd.DataFrame(rows)
 
 def apply_rotation_filter(ranked_df, history):
     """
@@ -1903,12 +1975,14 @@ if st.button("🚀 Начать моделирование", type="primary", dis
 
     if not blocked_df.empty:
         with st.expander("⛔ Культуры, исключённые из-за севооборота"):
-            render_wrapped_table(blocked_df.drop(columns=["Разрешено севооборотом", "Причина_блокировки"]), col_widths_pct=result_col_widths)
+            blocked_display_df = build_blocked_table(blocked_df, history)
+            render_wrapped_table(blocked_display_df, col_widths_pct=[16, 24, 22, 16, 22])
 
     st.subheader("📝 Почему именно эти культуры")
     if not allowed_df.empty:
         best_crop_name = allowed_df.iloc[0]["Культура"]
         st.write(explain_best_crop(best_crop_name, sub_scores_by_crop[best_crop_name], user_weights))
+        st.write(explain_predecessor_relationship(best_crop_name, CROPS[best_crop_name]["эффект_азот"], history))
 
         if len(allowed_df) > 1:
             second_crop_name = allowed_df.iloc[1]["Культура"]
@@ -1922,6 +1996,7 @@ if st.button("🚀 Начать моделирование", type="primary", dis
 
             weakest_crop_name = allowed_df.iloc[-1]["Культура"]
             st.write(explain_weak_crop(weakest_crop_name, sub_scores_by_crop[weakest_crop_name], user_weights))
+            st.write(explain_predecessor_relationship(weakest_crop_name, CROPS[weakest_crop_name]["эффект_азот"], history))
 
     if not blocked_df.empty:
         for _, row in blocked_df.iterrows():
