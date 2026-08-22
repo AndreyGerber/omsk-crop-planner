@@ -1013,26 +1013,30 @@ HEAT_TOLERANCE_THRESHOLDS = {"низкая": 3, "средняя": 8, "высок
 # ---------------------------------------------------------------------------
 
 DEFAULT_WEIGHTS = {
-    "почва": 20,
-    "ph": 15,
-    "окно": 20,
-    "gdd": 15,
-    "вода": 15,
+    "почва": 18,
+    "ph": 13,
+    "окно": 18,
+    "gdd": 13,
+    "вода": 13,
     "жара": 5,
     "урожайность": 10,
+    "предшественник": 10,
 }
 
 
-def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights, return_details=False):
+def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights, return_details=False, predecessor_effect=None):
     """
     Возвращает итоговый балл (0-100) пригодности культуры для заданных условий.
 
     weights: dict с ключами "почва", "ph", "окно", "gdd", "вода", "жара",
-    "урожайность" — относительные приоритеты пользователя (не обязательно
-    должны давать в сумме 100, функция нормирует сама).
+    "урожайность", "предшественник" — относительные приоритеты пользователя
+    (не обязательно должны давать в сумме 100, функция нормирует сама).
 
     Каждый под-балл сначала нормируется в диапазон 0-1, затем комбинируется
     с весами пользователя.
+
+    predecessor_effect: эффект_азот последней культуры на этом поле (или
+    None, если неизвестно) — используется для оценки влияния предшественника.
 
     return_details=True: возвращает (итоговый_балл, sub_scores) вместо
     только числа — используется для текстового объяснения результата.
@@ -1107,6 +1111,10 @@ def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights, return_d
     max_yield = max(c["урожайность_ц_га"] for c in CROPS.values())
     yield_score = min(1.0, crop["урожайность_ц_га"] / max_yield)
 
+    # 8. Влияние предшественника (0-1) — насколько удачно сочетается азотный
+    # эффект предыдущей культуры на этом поле с эффектом культуры-кандидата
+    predecessor_score = predecessor_effect_score(predecessor_effect, crop["эффект_азот"])
+
     sub_scores = {
         "почва": soil_score,
         "ph": ph_score,
@@ -1115,6 +1123,7 @@ def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights, return_d
         "вода": water_score,
         "жара": heat_score,
         "урожайность": yield_score,
+        "предшественник": predecessor_score,
     }
 
     total_weight = sum(weights.values())
@@ -1134,7 +1143,41 @@ FACTOR_LABELS = {
     "вода": "влагообеспеченность",
     "жара": "жаростойкость",
     "урожайность": "урожайный потенциал",
+    "предшественник": "влияние предыдущей культуры (азот)",
 }
+
+# Bewertung (0-1), wie gut eine Kultur nach der jeweils VORHERIGEN Kultur auf
+# demselben Feld passt — basierend auf эффект_азот (связывающий/нейтральный/
+# истощающий). Eine stickstoffbindende Vorfrucht (z.B. Erbse) ist ideal vor
+# einer stickstoffzehrenden Folgekultur; zwei zehrende Kulturen hintereinander
+# sind ungünstig — unabhängig davon, ob es dieselbe Kultur ist oder nicht.
+PREDECESSOR_EFFECT_TABLE = {
+    ("связывающий", "истощающий"): 1.0,
+    ("связывающий", "нейтральный"): 0.85,
+    ("связывающий", "связывающий"): 0.8,
+    ("истощающий", "истощающий"): 0.3,
+    ("истощающий", "связывающий"): 1.0,
+    ("истощающий", "нейтральный"): 0.6,
+    ("нейтральный", "истощающий"): 0.6,
+    ("нейтральный", "связывающий"): 0.8,
+    ("нейтральный", "нейтральный"): 0.7,
+}
+
+
+def predecessor_effect_score(prev_effect, candidate_effect):
+    """Score (0-1) für die Kombination Vorfrucht -> Kandidat, siehe PREDECESSOR_EFFECT_TABLE."""
+    if prev_effect is None:
+        return 0.7  # keine Historie bekannt -> neutral, weder Bonus noch Malus
+    return PREDECESSOR_EFFECT_TABLE.get((prev_effect, candidate_effect), 0.6)
+
+
+def get_predecessor_effect(history):
+    """Ermittelt эффект_азот der zuletzt (jüngstes Jahr) angebauten Kultur, oder None."""
+    if not history:
+        return None
+    letztes_jahr = max(history.keys())
+    letzte_kultur = history[letztes_jahr]
+    return CROPS.get(letzte_kultur, {}).get("эффект_азот")
 
 
 def explain_best_crop(crop_name, sub_scores, weights, top_n=3):
@@ -1204,8 +1247,17 @@ def compare_two_crops(name1, sub_scores1, name2, sub_scores2, weights, top_n=3, 
     return " ".join(parts)
 
 
-def explain_rotation_exclusion(crop_name, crop_data, history):
-    """Erklärt, warum eine Kultur wegen Fruchtfolge ausgeschlossen wurde."""
+def explain_rotation_exclusion(crop_name, crop_data, history, reason=None):
+    """Erklärt, warum eine Kultur ausgeschlossen wurde — Wiederholung ODER Nährstoffkette."""
+    if reason == "истощение":
+        letztes_jahr = max(history.keys())
+        letzte_kultur = history[letztes_jahr]
+        return (
+            f"**{crop_name}** исключена: в {letztes_jahr} году на поле уже росла истощающая "
+            f"почву культура ({letzte_kultur}), а {crop_name} тоже истощающая — две истощающие "
+            f"культуры подряд истощат почву без восстановления азота."
+        )
+
     gap = crop_data["интервал_севооборота_лет"]
     letzte_jahre = [year for year, planted in history.items() if planted == crop_name]
     if not letzte_jahre:
@@ -1219,19 +1271,40 @@ def explain_rotation_exclusion(crop_name, crop_data, history):
 
 
 def apply_rotation_filter(ranked_df, history):
-    """Убирает культуры, которые нарушают минимальный интервал севооборота."""
+    """
+    Убирает культуры, которые нарушают минимальный интервал севооборота
+    (та же самая культура слишком рано), А ТАКЖЕ культуры, которые продолжают
+    цепочку истощения почвы (две истощающие культуры подряд — даже если это
+    РАЗНЫЕ культуры) — оба случая помечаются с указанием причины.
+    """
     current_year = max(history.keys()) + 1 if history else None
+    letztes_jahr = max(history.keys()) if history else None
+    letzte_kultur = history.get(letztes_jahr) if letztes_jahr is not None else None
+    letzter_effekt = CROPS.get(letzte_kultur, {}).get("эффект_азот") if letzte_kultur else None
+
     filtered = []
     for _, row in ranked_df.iterrows():
         crop_name = row["Культура"]
         gap = CROPS[crop_name]["интервал_севооборота_лет"]
         blocked = False
+        reason = ""
+
+        # Grund 1: exakte Wiederholung derselben Kultur innerhalb des Mindestintervalls
         for year, planted_crop in history.items():
             if planted_crop == crop_name and current_year is not None:
                 if (current_year - year) < gap:
                     blocked = True
+                    reason = "повтор"
                     break
+
+        # Grund 2: Nährstoff-Erschöpfungskette — zwei ИСТОЩАЮЩИЕ Kulturen in
+        # Folge, unabhängig davon ob es dieselbe Kultur ist oder nicht
+        if not blocked and letzter_effekt == "истощающий" and CROPS[crop_name]["эффект_азот"] == "истощающий":
+            blocked = True
+            reason = "истощение"
+
         row["Разрешено севооборотом"] = "Нет" if blocked else "Да"
+        row["Причина_блокировки"] = reason
         filtered.append(row)
     return pd.DataFrame(filtered)
 
@@ -1524,6 +1597,10 @@ with st.expander("ℹ️ Что означает каждый параметр")
             "Параметр": "Урожайность",
             "Определение": "Урожайность — это количество продукции (в центнерах с гектара, ц/га), которое культура обычно даёт при благоприятных условиях. Это справочный, «паспортный» показатель культуры — он не зависит от конкретного поля или зоны, а отражает её общий потенциал по сравнению с другими культурами.",
         },
+        {
+            "Параметр": "Влияние предшественника",
+            "Определение": "Насколько удачно культура-кандидат сочетается с той культурой, что росла на этом поле в прошлом году, по азотному эффекту. Азотфиксирующие культуры (горох, чечевица) обогащают почву азотом — после них хорошо сеять азотоистощающие культуры (рапс, подсолнечник). Две истощающие культуры подряд, наоборот, обедняют почву без восстановления.",
+        },
     ])
     render_wrapped_table(param_definitions, col_widths_pct=[18, 82])
 
@@ -1576,6 +1653,13 @@ with st.expander("ℹ️ Что означает каждый параметр")
                 "Что измеряет": "Потенциальная урожайность культуры относительно максимума в таблице",
                 "Формула": "урожайность_культуры / максимальная_урожайность_среди_всех_культур — от условий поля/зоны НЕ зависит",
                 "Источник данных": "Справочная таблица культур (фиксированные значения)",
+            },
+            {
+                "Параметр": "Влияние предшественника",
+                "Что измеряет": "Насколько удачно азотный эффект культуры-кандидата сочетается с азотным эффектом культуры, росшей на поле в прошлом году",
+                "Формула": "Таблица сочетаний: связывающий→истощающий = 1.0 (идеально) · истощающий→истощающий = 0.3 (плохо) · "
+                           "истощающий→связывающий = 1.0 (восстановление) · нет истории = 0.7 (нейтрально)",
+                "Источник данных": "История посевов (шаг 3) + эффект_азот культуры-предшественника и культуры-кандидата",
             },
         ])
         render_wrapped_table(param_explanation, col_widths_pct=[14, 24, 42, 20])
@@ -1633,6 +1717,7 @@ with st.expander("ℹ️ Что означает каждый параметр")
 WEIGHT_KEYS = {
     "почва": "w_soil", "ph": "w_ph", "окно": "w_window", "gdd": "w_gdd",
     "вода": "w_water", "жара": "w_heat", "урожайность": "w_yield",
+    "предшественник": "w_predecessor",
 }
 
 
@@ -1663,13 +1748,15 @@ with weight_row1[2]:
 with weight_row1[3]:
     w_gdd = st.slider("Тепловая сумма (GDD)", 0, 100, DEFAULT_WEIGHTS["gdd"], key="w_gdd", help="Насколько важно, чтобы зоне хватало тепла для вызревания")
 
-weight_row2 = st.columns(3)
+weight_row2 = st.columns(4)
 with weight_row2[0]:
     w_water = st.slider("Влагообеспеченность", 0, 100, DEFAULT_WEIGHTS["вода"], key="w_water", help="Осадки + риск длинной засухи")
 with weight_row2[1]:
     w_heat = st.slider("Жаростойкость", 0, 100, DEFAULT_WEIGHTS["жара"], key="w_heat", help="Насколько важна устойчивость к жарким дням")
 with weight_row2[2]:
     w_yield = st.slider("Урожайность", 0, 100, DEFAULT_WEIGHTS["урожайность"], key="w_yield", help="Насколько важен потенциальный урожай (ц/га)")
+with weight_row2[3]:
+    w_predecessor = st.slider("Влияние предшественника", 0, 100, DEFAULT_WEIGHTS["предшественник"], key="w_predecessor", help="Насколько важно, какая культура росла на поле в прошлом году (азотный эффект)")
 
 user_weights = {
     "почва": w_soil,
@@ -1679,6 +1766,7 @@ user_weights = {
     "вода": w_water,
     "жара": w_heat,
     "урожайность": w_yield,
+    "предшественник": w_predecessor,
 }
 
 total_w = sum(user_weights.values())
@@ -1771,6 +1859,7 @@ st.divider()
 if st.button("🚀 Начать моделирование", type="primary", disabled=(not weights_valid)):
     results = []
     sub_scores_by_crop = {}
+    predecessor_effect = get_predecessor_effect(history)
     for crop_name, crop in CROPS.items():
         cal_yield, n_obs = get_calibrated_yield(zone_id, crop_name, calibration_df)
         if cal_yield is not None:
@@ -1781,7 +1870,10 @@ if st.button("🚀 Начать моделирование", type="primary", dis
             effective_crop = crop
             urozhay_display = f"{crop['урожайность_ц_га']} (справочно)"
 
-        s, sub_scores = score_crop(crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights, return_details=True)
+        s, sub_scores = score_crop(
+            crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights,
+            return_details=True, predecessor_effect=predecessor_effect,
+        )
         sub_scores_by_crop[crop_name] = sub_scores
         harvest = estimate_harvest_window(crop_name, zone)
         harvest_display = harvest["дата"] + (f" {harvest['риск_текст']}" if harvest["риск"] else "")
@@ -1807,11 +1899,11 @@ if st.button("🚀 Начать моделирование", type="primary", dis
 
     st.subheader("✅ Рекомендованные культуры (с учётом севооборота)")
     result_col_widths = [12, 9, 12, 18, 12, 8, 9, 9, 11]  # Summe = 100, "Уборка" breiter wegen Risikohinweis
-    render_wrapped_table(allowed_df.drop(columns=["Разрешено севооборотом"]), col_widths_pct=result_col_widths)
+    render_wrapped_table(allowed_df.drop(columns=["Разрешено севооборотом", "Причина_блокировки"]), col_widths_pct=result_col_widths)
 
     if not blocked_df.empty:
         with st.expander("⛔ Культуры, исключённые из-за севооборота"):
-            render_wrapped_table(blocked_df.drop(columns=["Разрешено севооборотом"]), col_widths_pct=result_col_widths)
+            render_wrapped_table(blocked_df.drop(columns=["Разрешено севооборотом", "Причина_блокировки"]), col_widths_pct=result_col_widths)
 
     st.subheader("📝 Почему именно эти культуры")
     if not allowed_df.empty:
@@ -1834,7 +1926,8 @@ if st.button("🚀 Начать моделирование", type="primary", dis
     if not blocked_df.empty:
         for _, row in blocked_df.iterrows():
             crop_name_blocked = row["Культура"]
-            st.write(explain_rotation_exclusion(crop_name_blocked, CROPS[crop_name_blocked], history))
+            reason = row.get("Причина_блокировки", "")
+            st.write(explain_rotation_exclusion(crop_name_blocked, CROPS[crop_name_blocked], history, reason=reason))
 
     st.caption(
         "Балл пригодности рассчитан на основе соответствия почвы, pH, вегетационного окна "
