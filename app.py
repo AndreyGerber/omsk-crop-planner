@@ -5,6 +5,7 @@
 
 import os
 import csv
+from collections import defaultdict
 from datetime import date, timedelta
 
 import streamlit as st
@@ -181,6 +182,7 @@ CLIMATE_FALLBACK = {
 
 REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
 SHORT_TERM_CSV = os.path.join(REPO_ROOT, "data", "short_term", "weekly_weather.csv")
+DAILY_SPRING_CSV = os.path.join(REPO_ROOT, "data", "short_term", "daily_spring_weather.csv")
 LONG_TERM_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_climate_trend.csv")
 PER_YEAR_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_per_year_metrics.csv")
 MONTHLY_CSV = os.path.join(REPO_ROOT, "data", "long_term", "yearly_monthly_metrics.csv")
@@ -299,6 +301,55 @@ def load_all_weekly(csv_path):
     for (zone_id, jahr), group in df.groupby(["zone_id", "jahr"]):
         result[(zone_id, int(jahr))] = group.sort_values("iso_woche").to_dict("records")
     return result
+
+
+@st.cache_data(ttl=3600)
+def load_daily_spring(csv_path):
+    """Lädt die tagesgenauen Frühjahrsdaten des LAUFENDEN Jahres (1. März – 7. Mai)."""
+    if not os.path.isfile(csv_path):
+        return pd.DataFrame()
+    return pd.read_csv(csv_path)
+
+
+def weekly_series_by_position(zone_id, jahr, weekly_data):
+    """
+    Wandelt die Wochendaten eines historischen Jahres in eine Reihe um, die
+    nach POSITION (1., 2., 3. Woche der Saison) statt nach Kalenderdatum
+    indiziert ist — dadurch lassen sich mehrere Jahre nebeneinander
+    vergleichen, ohne die (zwischen Jahren leicht verschobenen) echten
+    Kalenderdaten in derselben Spalte zu vermischen.
+    """
+    weeks = weekly_data.get((zone_id, jahr), [])
+    weeks_sorted = sorted(weeks, key=lambda w: w["iso_woche"])
+    return {
+        pos: {"niederschlag_mm": w["niederschlag_mm"], "temperatur_mittel_c": w["temperatur_mittel_c"]}
+        for pos, w in enumerate(weeks_sorted, start=1)
+    }
+
+
+def weekly_series_from_daily(daily_rows):
+    """
+    Aggregiert Tagesdaten (laufendes Jahr, März-Anfang Mai) zu Wochen und
+    nummeriert sie nach Position ab 1 — analog zu weekly_series_by_position,
+    damit beide Reihen direkt vergleichbar sind.
+    """
+    by_week = defaultdict(list)
+    for r in daily_rows:
+        d = date.fromisoformat(r["date"])
+        iso_year, iso_week, _ = d.isocalendar()
+        by_week[(iso_year, iso_week)].append(r)
+
+    weeks_sorted = sorted(by_week.keys())
+    result = {}
+    for pos, key in enumerate(weeks_sorted, start=1):
+        recs = by_week[key]
+        result[pos] = {
+            "niederschlag_mm": round(sum(float(r["niederschlag_mm"]) for r in recs), 1),
+            "temperatur_mittel_c": round(sum(float(r["temperatur_c"]) for r in recs) / len(recs), 1),
+        }
+    return result
+
+
 
 
 def characterize_harvest_wetness(zone_id, harvest_month, analog_years, monthly_data):
@@ -621,6 +672,7 @@ ZONES = build_zones()
 PER_YEAR_DATA = load_all_per_year(PER_YEAR_CSV)
 MONTHLY_DATA = load_all_monthly(MONTHLY_CSV)
 WEEKLY_DATA = load_all_weekly(WEEKLY_CSV)
+DAILY_SPRING_DF = load_daily_spring(DAILY_SPRING_CSV)
 
 
 def render_zone_map(selected_zone_id):
@@ -1200,54 +1252,58 @@ if analog_years:
         render_wrapped_table(summary_df, col_widths_pct=[7, 14, 11, 13, 13, 12, 12, 10, 8])
 
         st.write("**Погода по неделям в похожих годах** (март–октябрь):")
-        weekly_rows = []
+
+        # Positions-basierte Reihen (Woche 1, 2, 3... der Saison) für jedes
+        # Analog-Jahr — Kalenderdaten variieren leicht zwischen Jahren,
+        # daher NICHT nach echtem Datum ausrichten, sondern nach Position
+        # innerhalb der Saison (vermeidet vermischte/verwirrende Datumsangaben).
+        temp_series = {}
+        precip_series = {}
+
+        current_year_label = f"{date.today().year} (текущий)"
+        if not DAILY_SPRING_DF.empty:
+            current_daily_rows = DAILY_SPRING_DF[DAILY_SPRING_DF["zone_id"] == zone_id].to_dict("records")
+            if current_daily_rows:
+                current_weekly = weekly_series_from_daily(current_daily_rows)
+                if current_weekly:
+                    temp_series[current_year_label] = {p: v["temperatur_mittel_c"] for p, v in current_weekly.items()}
+                    precip_series[current_year_label] = {p: v["niederschlag_mm"] for p, v in current_weekly.items()}
+
+        analog_temp_series = {}
+        analog_precip_series = {}
         for a in analog_years:
-            key = (zone_id, a["jahr"])
-            weeks_data = WEEKLY_DATA.get(key, [])
-            for w in weeks_data:
-                weekly_rows.append({
-                    "Год": str(a["jahr"]),
-                    "iso_нед": w["iso_woche"],
-                    "Период": f"{w['von']} – {w['bis']}",
-                    "Осадки (мм)": w["niederschlag_mm"],
-                    "Температура (°C)": w["temperatur_mittel_c"],
-                })
+            jahr_str = str(a["jahr"])
+            pos_series = weekly_series_by_position(zone_id, a["jahr"], WEEKLY_DATA)
+            analog_temp_series[jahr_str] = {p: v["temperatur_mittel_c"] for p, v in pos_series.items()}
+            analog_precip_series[jahr_str] = {p: v["niederschlag_mm"] for p, v in pos_series.items()}
 
-        if weekly_rows:
-            weekly_df = pd.DataFrame(weekly_rows)
+        temp_series.update(analog_temp_series)
+        precip_series.update(analog_precip_series)
 
-            st.caption("Температура по неделям (для сравнения похожих лет):")
-            temp_pivot = weekly_df.pivot_table(index="iso_нед", columns="Год", values="Температура (°C)")
-            st.line_chart(temp_pivot)
+        if temp_series:
+            st.caption(
+                f"Температура по неделям — {current_year_label} (пока доступны только данные до "
+                f"начала мая) вместе с похожими годами для сравнения:"
+            )
+            temp_chart_df = pd.DataFrame(temp_series).sort_index()
+            st.line_chart(temp_chart_df)
 
-            st.caption("Осадки по неделям (для сравнения похожих лет):")
-            precip_pivot = weekly_df.pivot_table(index="iso_нед", columns="Год", values="Осадки (мм)")
-            st.bar_chart(precip_pivot)
+            st.caption("Осадки по неделям — то же сравнение:")
+            precip_chart_df = pd.DataFrame(precip_series).sort_index()
+            st.bar_chart(precip_chart_df)
 
-            st.caption("Точные значения по неделям (каждый год — отдельная подколонка):")
-
-            # Woche -> Zeitraum-Label (nimmt das erste verfügbare Jahr als Referenz für die Anzeige)
-            row_display = {}
-            for _, r in weekly_df.sort_values("iso_нед").iterrows():
-                if r["iso_нед"] not in row_display:
-                    row_display[r["iso_нед"]] = f"КВ {r['iso_нед']} ({r['Период']})"
-            row_keys = sorted(row_display.keys())
-
-            osadki_by_year = {}
-            temp_by_year = {}
-            for a in analog_years:
-                jahr_str = str(a["jahr"])
-                sub = weekly_df[weekly_df["Год"] == jahr_str]
-                osadki_by_year[jahr_str] = dict(zip(sub["iso_нед"], sub["Осадки (мм)"]))
-                temp_by_year[jahr_str] = dict(zip(sub["iso_нед"], sub["Температура (°C)"]))
+        if analog_temp_series:
+            st.caption("Точные значения по неделям похожих лет (каждый год — отдельная подколонка):")
+            row_keys = sorted({p for series in analog_temp_series.values() for p in series})
+            row_display = {p: f"Неделя {p}" for p in row_keys}
 
             render_grouped_weekly_table(
                 row_label="Неделя",
                 row_keys=row_keys,
                 row_display=row_display,
                 metric_groups={
-                    "Осадки (мм)": osadki_by_year,
-                    "Температура (°C)": temp_by_year,
+                    "Осадки (мм)": analog_precip_series,
+                    "Температура (°C)": analog_temp_series,
                 },
             )
         else:
