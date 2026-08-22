@@ -1023,7 +1023,7 @@ DEFAULT_WEIGHTS = {
 }
 
 
-def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights):
+def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights, return_details=False):
     """
     Возвращает итоговый балл (0-100) пригодности культуры для заданных условий.
 
@@ -1033,6 +1033,9 @@ def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights):
 
     Каждый под-балл сначала нормируется в диапазон 0-1, затем комбинируется
     с весами пользователя.
+
+    return_details=True: возвращает (итоговый_балл, sub_scores) вместо
+    только числа — используется для текстового объяснения результата.
     """
 
     # 1. Соответствие типа почвы (0-1)
@@ -1116,10 +1119,73 @@ def score_crop(crop_name, crop, zone, soil_type, ph, drainage, weights):
 
     total_weight = sum(weights.values())
     if total_weight == 0:
-        return 0.0
+        return (0.0, sub_scores) if return_details else 0.0
 
     score = sum(sub_scores[key] * weights[key] for key in sub_scores) / total_weight
-    return round(score * 100, 1)
+    final_score = round(score * 100, 1)
+    return (final_score, sub_scores) if return_details else final_score
+
+
+FACTOR_LABELS = {
+    "почва": "тип почвы",
+    "ph": "кислотность почвы (pH)",
+    "окно": "длина вегетационного окна",
+    "gdd": "тепловая сумма (GDD)",
+    "вода": "влагообеспеченность",
+    "жара": "жаростойкость",
+    "урожайность": "урожайный потенциал",
+}
+
+
+def explain_best_crop(crop_name, sub_scores, weights, top_n=3):
+    """
+    Erklärt, WARUM eine Kultur den höchsten Score bekam — zeigt die
+    Faktoren, die (Teilwert × Gewicht) am meisten zum Gesamtergebnis
+    beigetragen haben, nicht nur den nackten Endwert.
+    """
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        return f"**{crop_name}** — недостаточно данных для объяснения (все веса на нуле)."
+
+    contributions = {k: sub_scores[k] * weights[k] / total_weight * 100 for k in sub_scores}
+    top_factors = sorted(contributions.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    parts = [f"{FACTOR_LABELS[k]} ({round(v, 1)} балла)" for k, v in top_factors]
+
+    return f"**{crop_name}** получила наивысший балл прежде всего благодаря: {', '.join(parts)}."
+
+
+def explain_weak_crop(crop_name, sub_scores, weights, top_n=3):
+    """
+    Erklärt, WARUM eine (nicht durch Rotation blockierte) Kultur schlecht
+    abschneidet — zeigt die Faktoren mit dem größten Punktverlust
+    (Gewicht × fehlender Teilwert), nicht nur den nackten Endwert.
+    """
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        return f"**{crop_name}** — недостаточно данных для объяснения (все веса на нуле)."
+
+    deficits = {k: (1 - sub_scores[k]) * weights[k] / total_weight * 100 for k in sub_scores}
+    worst_factors = sorted(deficits.items(), key=lambda kv: kv[1], reverse=True)[:top_n]
+    worst_factors = [(k, v) for k, v in worst_factors if v > 0.5]  # nur nennenswerte Schwächen
+    if not worst_factors:
+        return f"**{crop_name}** получила невысокий балл из-за небольшого отставания сразу по нескольким параметрам."
+    parts = [f"{FACTOR_LABELS[k]} (потеряно {round(v, 1)} балла)" for k, v in worst_factors]
+
+    return f"**{crop_name}** получила невысокий балл из-за: {', '.join(parts)}."
+
+
+def explain_rotation_exclusion(crop_name, crop_data, history):
+    """Erklärt, warum eine Kultur wegen Fruchtfolge ausgeschlossen wurde."""
+    gap = crop_data["интервал_севооборота_лет"]
+    letzte_jahre = [year for year, planted in history.items() if planted == crop_name]
+    if not letzte_jahre:
+        return f"**{crop_name}** исключена из-за севооборота (требуется интервал {gap} г.)."
+    letztes_jahr = max(letzte_jahre)
+    return (
+        f"**{crop_name}** исключена: уже сеялась на этом поле в {letztes_jahr} году, "
+        f"а минимальный интервал севооборота для неё — {gap} г."
+    )
+
 
 
 def apply_rotation_filter(ranked_df, history):
@@ -1293,19 +1359,20 @@ if analog_years:
             st.bar_chart(precip_chart_df)
 
         if analog_temp_series:
-            st.caption("Точные значения по неделям похожих лет (каждый год — отдельная подколонка):")
-            row_keys = sorted({p for series in analog_temp_series.values() for p in series})
-            row_display = {p: f"Неделя {p}" for p in row_keys}
+            show_weekly_table = st.checkbox("Показать точную таблицу по неделям", key=f"weekly_table_{zone_id}")
+            if show_weekly_table:
+                row_keys = sorted({p for series in analog_temp_series.values() for p in series})
+                row_display = {p: f"Неделя {p}" for p in row_keys}
 
-            render_grouped_weekly_table(
-                row_label="Неделя",
-                row_keys=row_keys,
-                row_display=row_display,
-                metric_groups={
-                    "Осадки (мм)": analog_precip_series,
-                    "Температура (°C)": analog_temp_series,
-                },
-            )
+                render_grouped_weekly_table(
+                    row_label="Неделя",
+                    row_keys=row_keys,
+                    row_display=row_display,
+                    metric_groups={
+                        "Осадки (мм)": analog_precip_series,
+                        "Температура (°C)": analog_temp_series,
+                    },
+                )
         else:
             st.caption("Понедельные данные для похожих лет не найдены.")
 elif "_kurzfristig_zeitraum" in zone:
@@ -1671,6 +1738,7 @@ st.divider()
 
 if st.button("🚀 Начать моделирование", type="primary", disabled=(not weights_valid)):
     results = []
+    sub_scores_by_crop = {}
     for crop_name, crop in CROPS.items():
         cal_yield, n_obs = get_calibrated_yield(zone_id, crop_name, calibration_df)
         if cal_yield is not None:
@@ -1681,7 +1749,8 @@ if st.button("🚀 Начать моделирование", type="primary", dis
             effective_crop = crop
             urozhay_display = f"{crop['урожайность_ц_га']} (справочно)"
 
-        s = score_crop(crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights)
+        s, sub_scores = score_crop(crop_name, effective_crop, zone, soil_type, ph, drainage, user_weights, return_details=True)
+        sub_scores_by_crop[crop_name] = sub_scores
         harvest = estimate_harvest_window(crop_name, zone)
         harvest_display = harvest["дата"] + (f" {harvest['риск_текст']}" if harvest["риск"] else "")
         results.append({
@@ -1711,6 +1780,20 @@ if st.button("🚀 Начать моделирование", type="primary", dis
     if not blocked_df.empty:
         with st.expander("⛔ Культуры, исключённые из-за севооборота"):
             render_wrapped_table(blocked_df.drop(columns=["Разрешено севооборотом"]), col_widths_pct=result_col_widths)
+
+    st.subheader("📝 Почему именно эти культуры")
+    if not allowed_df.empty:
+        best_crop_name = allowed_df.iloc[0]["Культура"]
+        st.write(explain_best_crop(best_crop_name, sub_scores_by_crop[best_crop_name], user_weights))
+
+        if len(allowed_df) > 1:
+            weakest_crop_name = allowed_df.iloc[-1]["Культура"]
+            st.write(explain_weak_crop(weakest_crop_name, sub_scores_by_crop[weakest_crop_name], user_weights))
+
+    if not blocked_df.empty:
+        for _, row in blocked_df.iterrows():
+            crop_name_blocked = row["Культура"]
+            st.write(explain_rotation_exclusion(crop_name_blocked, CROPS[crop_name_blocked], history))
 
     st.caption(
         "Балл пригодности рассчитан на основе соответствия почвы, pH, вегетационного окна "
