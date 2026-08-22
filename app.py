@@ -1174,6 +1174,36 @@ def explain_weak_crop(crop_name, sub_scores, weights, top_n=3):
     return f"**{crop_name}** получила невысокий балл из-за: {', '.join(parts)}."
 
 
+def compare_two_crops(name1, sub_scores1, name2, sub_scores2, weights, top_n=3, threshold=0.5):
+    """
+    Vergleicht zwei Kulturen direkt: zeigt, in welchen Faktoren die eine
+    gegenüber der anderen einen Punktvorteil hat (gewichteter Beitrag),
+    in beide Richtungen — statt nur die Endsumme gegenüberzustellen.
+    """
+    total_weight = sum(weights.values())
+    if total_weight == 0:
+        return ""
+
+    contrib1 = {k: sub_scores1[k] * weights[k] / total_weight * 100 for k in sub_scores1}
+    contrib2 = {k: sub_scores2[k] * weights[k] / total_weight * 100 for k in sub_scores2}
+    diffs = {k: contrib1[k] - contrib2[k] for k in contrib1}
+
+    wins1 = sorted([(k, v) for k, v in diffs.items() if v > threshold], key=lambda kv: kv[1], reverse=True)[:top_n]
+    wins2 = sorted([(k, v) for k, v in diffs.items() if v < -threshold], key=lambda kv: kv[1])[:top_n]
+
+    parts = []
+    if wins1:
+        txt1 = ", ".join(f"{FACTOR_LABELS[k]} (+{round(v, 1)} балла)" for k, v in wins1)
+        parts.append(f"**{name1}** выигрывает у **{name2}** по: {txt1}.")
+    if wins2:
+        txt2 = ", ".join(f"{FACTOR_LABELS[k]} (+{round(-v, 1)} балла)" for k, v in wins2)
+        parts.append(f"**{name2}**, в свою очередь, лучше по: {txt2}.")
+
+    if not parts:
+        return f"**{name1}** и **{name2}** показывают очень похожие результаты по всем параметрам."
+    return " ".join(parts)
+
+
 def explain_rotation_exclusion(crop_name, crop_data, history):
     """Erklärt, warum eine Kultur wegen Fruchtfolge ausgeschlossen wurde."""
     gap = crop_data["интервал_севооборота_лет"]
@@ -1348,14 +1378,16 @@ if analog_years:
 
         if temp_series:
             st.caption(
-                f"Температура по неделям — {current_year_label} (пока доступны только данные до "
-                f"начала мая) вместе с похожими годами для сравнения:"
+                f"**Температура по неделям, °C** (ось X — номер недели сезона; линии — "
+                f"{current_year_label}, пока доступны только данные до начала мая, вместе с похожими годами):"
             )
             temp_chart_df = pd.DataFrame(temp_series).sort_index()
+            temp_chart_df.index.name = "Неделя сезона"
             st.line_chart(temp_chart_df)
 
-            st.caption("Осадки по неделям — то же сравнение:")
+            st.caption("**Осадки по неделям, мм** (ось X — номер недели сезона):")
             precip_chart_df = pd.DataFrame(precip_series).sort_index()
+            precip_chart_df.index.name = "Неделя сезона"
             st.bar_chart(precip_chart_df)
 
         if analog_temp_series:
@@ -1787,6 +1819,15 @@ if st.button("🚀 Начать моделирование", type="primary", dis
         st.write(explain_best_crop(best_crop_name, sub_scores_by_crop[best_crop_name], user_weights))
 
         if len(allowed_df) > 1:
+            second_crop_name = allowed_df.iloc[1]["Культура"]
+            st.write(
+                compare_two_crops(
+                    best_crop_name, sub_scores_by_crop[best_crop_name],
+                    second_crop_name, sub_scores_by_crop[second_crop_name],
+                    user_weights,
+                )
+            )
+
             weakest_crop_name = allowed_df.iloc[-1]["Культура"]
             st.write(explain_weak_crop(weakest_crop_name, sub_scores_by_crop[weakest_crop_name], user_weights))
 
